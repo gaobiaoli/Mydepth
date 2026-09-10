@@ -8,7 +8,10 @@ build/
 dist/
 *.egg-info/
 data/processed/
-outputs/*
 !outputs/.gitkeep
 configs/local/
 checkpoints/
+*.pth
+*.pt
+*.ckpt
+outputs/zero_shot_raw/da3_cache/
