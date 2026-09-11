@@ -16,9 +16,22 @@ SPATIAL_KEYS = (
     "da3_depth",
     "bim_depth",
     "bim_valid",
+    "bim_normals",
+    "bim_edge",
     "gt_depth",
     "gt_valid",
 )
+
+
+def randint_inclusive(
+    rng,
+    low: int,
+    high: int,
+) -> int:
+    """Draw an inclusive integer from Python random or NumPy Generator."""
+    if hasattr(rng, "integers"):
+        return int(rng.integers(low, high + 1))
+    return int(rng.randint(low, high))
 
 
 def validate_probability(
@@ -41,7 +54,7 @@ class Transform(ABC):
     Base class for sample-level augmentation.
 
     Every transform receives the complete multimodal sample and
-    an explicit NumPy RNG.
+    an explicit RNG.
 
     A transform may modify the sample in-place and return it.
     """

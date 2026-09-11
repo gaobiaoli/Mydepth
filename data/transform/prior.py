@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 from .base import (
     Sample,
     Transform,
+    randint_inclusive,
     validate_probability,
 )
 
@@ -148,7 +150,10 @@ class RandomBIMLogNoise(Transform):
 
         depth = depth.copy()
 
-        noise = rng.normal(
+        # PriorBIMDA uses Python random for the probability decision and the
+        # NumPy global RNG for the actual per-pixel noise.
+        noise_rng = rng if hasattr(rng, "normal") else np.random
+        noise = noise_rng.normal(
             0.0,
             self.sigma,
             size=depth.shape,
@@ -308,6 +313,114 @@ class RandomBIMRectHole(Transform):
         return sample
 
 
+@dataclass
+class RandomBIMSquareDropout(Transform):
+    """PriorBIMDA fixed-area square BIM dropout."""
+
+    fraction: float = 0.12
+    p: float = 0.15
+
+    def __post_init__(self):
+        self.fraction = float(self.fraction)
+        self.p = validate_probability(self.p)
+
+        if not 0.0 <= self.fraction <= 1.0:
+            raise ValueError("fraction must be in [0, 1]")
+
+    def __call__(
+        self,
+        sample: Sample,
+        *,
+        rng: np.random.Generator,
+    ) -> Sample:
+
+        if rng.random() >= self.p:
+            return sample
+
+        depth, _ = _get_bim(sample)
+        height, width = depth.shape[-2:]
+        area = int(self.fraction * height * width)
+        side = max(1, int(np.sqrt(area)))
+        y = randint_inclusive(rng, 0, max(0, height - side))
+        x = randint_inclusive(rng, 0, max(0, width - side))
+
+        sample["bim_valid"][..., y : y + side, x : x + side] = 0
+        sample["bim_depth"][..., y : y + side, x : x + side] = 0
+
+        if "bim_normals" in sample:
+            sample["bim_normals"][..., y : y + side, x : x + side] = 0
+        if "bim_edge" in sample:
+            sample["bim_edge"][..., y : y + side, x : x + side] = 1
+
+        return _enforce_bim_contract(sample)
+
+
+@dataclass
+class RandomBIMFullDropout(Transform):
+    """Invalidate the complete BIM prior, matching PriorBIMDA."""
+
+    p: float = 0.03
+
+    def __post_init__(self):
+        self.p = validate_probability(self.p)
+
+    def __call__(
+        self,
+        sample: Sample,
+        *,
+        rng: np.random.Generator,
+    ) -> Sample:
+
+        if rng.random() >= self.p:
+            return sample
+
+        _get_bim(sample)
+        sample["bim_valid"][...] = 0
+        sample["bim_depth"][...] = 0
+
+        if "bim_normals" in sample:
+            sample["bim_normals"][...] = 0
+        if "bim_edge" in sample:
+            sample["bim_edge"][...] = 1
+
+        return _enforce_bim_contract(sample)
+
+
+@dataclass
+class RandomBIMEdgeDilation(Transform):
+    """Dilate the optional BIM edge map using PriorBIMDA's kernel."""
+
+    pixels: int = 3
+    p: float = 0.15
+
+    def __post_init__(self):
+        self.pixels = int(self.pixels)
+        self.p = validate_probability(self.p)
+
+        if self.pixels < 0:
+            raise ValueError("pixels must be >= 0")
+
+    def __call__(
+        self,
+        sample: Sample,
+        *,
+        rng: np.random.Generator,
+    ) -> Sample:
+
+        # Consume the probability draw even when the compact MyDepth sample has
+        # no bim_edge field, preserving all later PriorBIMDA RNG decisions.
+        if rng.random() >= self.p or "bim_edge" not in sample:
+            return sample
+
+        kernel_size = max(1, self.pixels)
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        sample["bim_edge"][0] = cv2.dilate(
+            sample["bim_edge"][0].astype(np.float32),
+            kernel,
+        )
+        return sample
+
+
 def _translate_chw(
     value: np.ndarray,
     *,
@@ -415,19 +528,8 @@ class RandomBIMShift(Transform):
 
         depth, valid = _get_bim(sample)
 
-        dx = int(
-            rng.integers(
-                -self.max_dx,
-                self.max_dx + 1,
-            )
-        )
-
-        dy = int(
-            rng.integers(
-                -self.max_dy,
-                self.max_dy + 1,
-            )
-        )
+        dx = randint_inclusive(rng, -self.max_dx, self.max_dx)
+        dy = randint_inclusive(rng, -self.max_dy, self.max_dy)
 
         depth = _translate_chw(
             depth,
@@ -451,5 +553,14 @@ class RandomBIMShift(Transform):
         )
 
         sample["bim_valid"] = (valid_float > 0.5).astype(np.float32)
+
+        for key in ("bim_normals", "bim_edge"):
+            if key in sample:
+                sample[key] = _translate_chw(
+                    sample[key],
+                    dx=dx,
+                    dy=dy,
+                    fill_value=0.0,
+                )
 
         return _enforce_bim_contract(sample)

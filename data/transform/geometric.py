@@ -9,6 +9,7 @@ from .base import (
     SPATIAL_KEYS,
     Sample,
     Transform,
+    randint_inclusive,
     validate_probability,
 )
 
@@ -34,6 +35,8 @@ def _get_hw(
 @dataclass
 class RandomHorizontalFlip(Transform):
     p: float = 0.5
+    update_intrinsic: bool = True
+    flip_bim_normal_x: bool = True
 
     def __post_init__(self):
         self.p = validate_probability(self.p)
@@ -65,7 +68,10 @@ class RandomHorizontalFlip(Transform):
 
             sample[key] = value[..., ::-1].copy()
 
-        if "intrinsic" in sample:
+        if self.flip_bim_normal_x and "bim_normals" in sample:
+            sample["bim_normals"][0] *= -1
+
+        if self.update_intrinsic and "intrinsic" in sample:
             K = sample["intrinsic"].copy()
 
             # x' = W - 1 - x
@@ -89,6 +95,7 @@ class RandomCrop(Transform):
 
     height: int
     width: int
+    update_intrinsic: bool = True
 
     def __post_init__(self):
         self.height = int(self.height)
@@ -114,19 +121,12 @@ class RandomCrop(Transform):
                 f"{(H, W)}"
             )
 
-        y0 = int(
-            rng.integers(
-                0,
-                H - self.height + 1,
-            )
-        )
+        # PriorBIMDA's configured 504x504 crop is a no-op and consumes no RNG.
+        if self.height == H and self.width == W:
+            return sample
 
-        x0 = int(
-            rng.integers(
-                0,
-                W - self.width + 1,
-            )
-        )
+        y0 = randint_inclusive(rng, 0, H - self.height)
+        x0 = randint_inclusive(rng, 0, W - self.width)
 
         y1 = y0 + self.height
         x1 = x0 + self.width
@@ -146,7 +146,7 @@ class RandomCrop(Transform):
                 x0:x1,
             ].copy()
 
-        if "intrinsic" in sample:
+        if self.update_intrinsic and "intrinsic" in sample:
             K = sample["intrinsic"].copy()
 
             K[0, 2] -= x0

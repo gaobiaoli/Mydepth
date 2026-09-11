@@ -16,20 +16,26 @@ from .photometric import (
 )
 from .prior import (
     RandomBIMDropout,
+    RandomBIMEdgeDilation,
+    RandomBIMFullDropout,
     RandomBIMLogNoise,
     RandomBIMRectHole,
     RandomBIMScale,
     RandomBIMShift,
+    RandomBIMSquareDropout,
 )
 
 __all__ = [
     "Compose",
     "Identity",
     "RandomBIMDropout",
+    "RandomBIMEdgeDilation",
+    "RandomBIMFullDropout",
     "RandomBIMLogNoise",
     "RandomBIMRectHole",
     "RandomBIMScale",
     "RandomBIMShift",
+    "RandomBIMSquareDropout",
     "RandomCrop",
     "RandomGamma",
     "RandomHorizontalFlip",

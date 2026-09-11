@@ -1,4 +1,3 @@
-# Stanford 2D-3D-S PriorBIM 数据集：负责数据加载、校验并调用 transform 完成原有增强。
 from __future__ import annotations
 
 import json
@@ -10,56 +9,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .transform import (
-    Compose,
-    RandomBIMEdgeDilation,
-    RandomBIMFullDropout,
-    RandomBIMLogNoise,
-    RandomBIMShift,
-    RandomBIMSquareDropout,
-    RandomCrop,
-    RandomHorizontalFlip,
-    RandomRGBGainBias,
-)
-
-
-transform = Compose(
-    [
-        RandomRGBGainBias(
-            gain_range=0.1,
-            bias_range=0.1,
-            p=1.0,
-        ),
-        RandomBIMShift(
-            max_dx=4,
-            max_dy=4,
-            p=0.2,
-        ),
-        RandomBIMSquareDropout(
-            fraction=0.12,
-            p=0.15,
-        ),
-        RandomBIMFullDropout(p=0.03),
-        RandomBIMLogNoise(
-            sigma=0.02,
-            p=0.2,
-        ),
-        RandomBIMEdgeDilation(
-            pixels=3,
-            p=0.15,
-        ),
-        RandomHorizontalFlip(
-            p=0.5,
-            update_intrinsic=False,
-            flip_bim_normal_x=True,
-        ),
-        RandomCrop(
-            height=504,
-            width=504,
-            update_intrinsic=False,
-        ),
-    ]
-)
 
 class S23PriorBIMDataset(Dataset):
     """
@@ -89,11 +38,6 @@ class S23PriorBIMDataset(Dataset):
     gt_depth
     gt_valid
 
-    Optional original PriorBIMDA fields
-    -----------------------------------
-    bim_normals
-    bim_edge
-
     Important
     ---------
     DA3 metric depth is reconstructed as:
@@ -112,6 +56,8 @@ class S23PriorBIMDataset(Dataset):
         split: str,
         *,
         augment: bool | None = None,
+        color_jitter: float = 0.0,
+        horizontal_flip_probability: float = 0.0,
     ):
         super().__init__()
 
@@ -138,12 +84,19 @@ class S23PriorBIMDataset(Dataset):
         if self.augment and self.split != "train":
             raise ValueError("Augmentation is train-only")
 
-        target_shape = (504, 504)
-        self.height, self.width = target_shape
+        self.color_jitter = float(color_jitter)
 
-        # Keep the same transform order and parameter values as the original
-        # PriorBIMDA F36/Adapter training dataset.
-        self.transform = transform
+        self.horizontal_flip_probability = float(horizontal_flip_probability)
+
+        if not (0.0 <= self.horizontal_flip_probability <= 1.0):
+            raise ValueError("horizontal_flip_probability " "must be in [0, 1]")
+
+        if self.color_jitter < 0:
+            raise ValueError("color_jitter must be >= 0")
+
+        target_shape = (504, 504)
+
+        self.height, self.width = target_shape
 
         # ---------------------------------------------------------
         # Manifest
@@ -161,7 +114,7 @@ class S23PriorBIMDataset(Dataset):
         ]
 
         if not self.records:
-            raise ValueError(f"Empty manifest: {manifest_path}")
+            raise ValueError(f"Empty manifest: " f"{manifest_path}")
 
         # ---------------------------------------------------------
         # Basic consistency checks
@@ -170,11 +123,11 @@ class S23PriorBIMDataset(Dataset):
         ids = [str(record["id"]) for record in self.records]
 
         if len(ids) != len(set(ids)):
-            raise ValueError(f"Duplicate sample IDs in {manifest_path}")
+            raise ValueError("Duplicate sample IDs " f"in {manifest_path}")
 
         for record in self.records:
             if record.get("split") != self.split:
-                raise ValueError(f"{record['id']}: manifest split mismatch")
+                raise ValueError(f"{record['id']}: " f"manifest split mismatch")
 
     # =============================================================
     # Paths
@@ -257,6 +210,7 @@ class S23PriorBIMDataset(Dataset):
             path,
             allow_pickle=False,
         ) as item:
+
             required = {
                 "sample_schema_version",
                 "intrinsic",
@@ -271,7 +225,7 @@ class S23PriorBIMDataset(Dataset):
             missing = required - set(item.files)
 
             if missing:
-                raise ValueError(f"{path}: missing keys {sorted(missing)}")
+                raise ValueError(f"{path}: missing keys " f"{sorted(missing)}")
 
             intrinsic = item["intrinsic"].astype(np.float32)
 
@@ -287,18 +241,12 @@ class S23PriorBIMDataset(Dataset):
 
             gt_valid = item["gt_valid"].astype(np.float32)
 
-            optional_bim = {}
-            if "bim_normals" in item.files:
-                optional_bim["bim_normals"] = item["bim_normals"].astype(np.float32)
-            if "bim_edge" in item.files:
-                optional_bim["bim_edge"] = item["bim_edge"].astype(np.float32)
-
         # ---------------------------------------------------------
         # DA3 metric focal correction
         # ---------------------------------------------------------
 
         if not np.isfinite(focal_scale) or focal_scale <= 0:
-            raise ValueError(f"{path}: invalid da3_focal_scale={focal_scale}")
+            raise ValueError(f"{path}: invalid " "da3_focal_scale=" f"{focal_scale}")
 
         da3_depth = da3_raw * focal_scale
 
@@ -318,27 +266,14 @@ class S23PriorBIMDataset(Dataset):
             "gt_depth": gt_depth,
             "gt_valid": gt_valid,
         }.items():
+
             if value.shape != shape:
                 raise ValueError(
-                    f"{path}: {name}.shape={value.shape}, expected={shape}"
+                    f"{path}: " f"{name}.shape=" f"{value.shape}, " f"expected={shape}"
                 )
 
         if intrinsic.shape != (3, 3):
-            raise ValueError(f"{path}: intrinsic shape={intrinsic.shape}")
-
-        if "bim_normals" in optional_bim and optional_bim["bim_normals"].shape != (
-            3,
-            *shape,
-        ):
-            raise ValueError(
-                f"{path}: bim_normals.shape={optional_bim['bim_normals'].shape}, "
-                f"expected={(3, *shape)}"
-            )
-        if "bim_edge" in optional_bim and optional_bim["bim_edge"].shape != shape:
-            raise ValueError(
-                f"{path}: bim_edge.shape={optional_bim['bim_edge'].shape}, "
-                f"expected={shape}"
-            )
+            raise ValueError(f"{path}: intrinsic " f"shape={intrinsic.shape}")
 
         if not np.isfinite(da3_depth).all() or np.any(da3_depth <= 0):
             raise ValueError(f"{path}: invalid DA3 depth")
@@ -348,16 +283,16 @@ class S23PriorBIMDataset(Dataset):
         gt_valid = gt_valid > 0
 
         if np.any(bim_valid & (~np.isfinite(bim_depth) | (bim_depth <= 0))):
-            raise ValueError(f"{path}: valid BIM pixels contain bad depth")
+            raise ValueError(f"{path}: valid BIM " "pixels contain bad depth")
 
         if np.any((~bim_valid) & (bim_depth != 0)):
-            raise ValueError(f"{path}: invalid BIM pixels are not zero")
+            raise ValueError(f"{path}: invalid BIM " "pixels are not zero")
 
         if np.any(gt_valid & (~np.isfinite(gt_depth) | (gt_depth <= 0))):
-            raise ValueError(f"{path}: valid GT pixels contain bad depth")
+            raise ValueError(f"{path}: valid GT " "pixels contain bad depth")
 
         # Return [C,H,W].
-        arrays = {
+        return {
             "intrinsic": intrinsic,
             "da3_depth": da3_depth[None],
             "bim_depth": bim_depth[None],
@@ -365,11 +300,6 @@ class S23PriorBIMDataset(Dataset):
             "gt_depth": gt_depth[None],
             "gt_valid": gt_valid.astype(np.float32)[None],
         }
-        if "bim_normals" in optional_bim:
-            arrays["bim_normals"] = optional_bim["bim_normals"]
-        if "bim_edge" in optional_bim:
-            arrays["bim_edge"] = optional_bim["bim_edge"][None]
-        return arrays
 
     # =============================================================
     # Augmentation
@@ -379,9 +309,63 @@ class S23PriorBIMDataset(Dataset):
         self,
         arrays: dict,
     ) -> dict:
-        # 使用 Python random 保持原数据集的随机数来源、调用顺序和
-        # DataLoader worker seeding 行为不变。
-        return self.transform(arrays, rng=random)
+
+        # ---------------------------------------------------------
+        # RGB-only brightness perturbation
+        # ---------------------------------------------------------
+
+        if self.color_jitter > 0:
+            amount = self.color_jitter
+
+            gain = random.uniform(
+                1.0 - amount,
+                1.0 + amount,
+            )
+
+            bias = random.uniform(
+                -amount,
+                amount,
+            )
+
+            arrays["rgb"] = np.clip(
+                arrays["rgb"] * gain + bias,
+                0.0,
+                1.0,
+            )
+
+        # ---------------------------------------------------------
+        # Joint horizontal flip
+        # ---------------------------------------------------------
+
+        if (
+            self.horizontal_flip_probability > 0
+            and random.random() < self.horizontal_flip_probability
+        ):
+            for key in (
+                "rgb",
+                "da3_depth",
+                "bim_depth",
+                "bim_valid",
+                "gt_depth",
+                "gt_valid",
+            ):
+                arrays[key] = arrays[key][..., ::-1].copy()
+
+            # Horizontal image flip changes cx.
+            #
+            # Pixel coordinate:
+            #   x' = W - 1 - x
+            #
+            # therefore
+            #   cx' = W - 1 - cx
+            #
+            intrinsic = arrays["intrinsic"].copy()
+
+            intrinsic[0, 2] = self.width - 1 - intrinsic[0, 2]
+
+            arrays["intrinsic"] = intrinsic
+
+        return arrays
 
     # =============================================================
     # Dataset API
@@ -446,19 +430,8 @@ def build_area1_dataloader(
     num_workers=8,
     shuffle=None,
     augment=None,
-    color_jitter=0.1,
-    horizontal_flip_probability=0.5,
-    bim_shift_probability=0.2,
-    bim_shift_pixels=4,
-    bim_dropout_probability=0.15,
-    bim_dropout_fraction=0.12,
-    bim_full_dropout_probability=0.03,
-    bim_depth_noise_probability=0.2,
-    bim_depth_noise_log_std=0.02,
-    bim_edge_dilation_probability=0.15,
-    bim_edge_dilation_pixels=3,
-    crop_height=504,
-    crop_width=504,
+    color_jitter=0.0,
+    horizontal_flip_probability=0.0,
     pin_memory=True,
     persistent_workers=True,
     drop_last=None,
@@ -470,17 +443,6 @@ def build_area1_dataloader(
         augment=augment,
         color_jitter=color_jitter,
         horizontal_flip_probability=(horizontal_flip_probability),
-        bim_shift_probability=bim_shift_probability,
-        bim_shift_pixels=bim_shift_pixels,
-        bim_dropout_probability=bim_dropout_probability,
-        bim_dropout_fraction=bim_dropout_fraction,
-        bim_full_dropout_probability=bim_full_dropout_probability,
-        bim_depth_noise_probability=bim_depth_noise_probability,
-        bim_depth_noise_log_std=bim_depth_noise_log_std,
-        bim_edge_dilation_probability=bim_edge_dilation_probability,
-        bim_edge_dilation_pixels=bim_edge_dilation_pixels,
-        crop_height=crop_height,
-        crop_width=crop_width,
     )
 
     if shuffle is None:

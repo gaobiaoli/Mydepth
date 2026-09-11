@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from data import S23PriorBIMDataset
 from eval import evaluate, move_to
-from model.mymodel3 import PriorBIMDA
+from model.mymodel import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
 
 
@@ -43,8 +43,6 @@ def build_loaders(args, generator):
         args.dataset_root,
         args.s23_root,
         "train",
-        color_jitter=0.1,
-        horizontal_flip_probability=0.5,
     )
     val_set = S23PriorBIMDataset(args.dataset_root, args.s23_root, "val", augment=False)
     test_set = S23PriorBIMDataset(
@@ -130,7 +128,7 @@ def main():
     )
     parser.add_argument("--s23-root", default="/home/bgao491/Stanford2D3DS/no_xyz")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--output", default="outputs/Reassemble_only_scale")
+    parser.add_argument("--output", default="outputs/raw3")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--accumulation", type=int, default=2)
