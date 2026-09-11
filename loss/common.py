@@ -55,6 +55,8 @@ def depth_weights(batch):
             batch["semantic_labels"],
             FURNITURE_CLASS_IDS,
             )
+        if furniture_mask.ndim == 3:
+            furniture_mask = furniture_mask.unsqueeze(1)
         weight = weight + furniture_mask.float()
 
     tolerance = torch.maximum(torch.full_like(batch["bim_depth"], 0.10),
