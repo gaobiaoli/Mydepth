@@ -1,3 +1,4 @@
+# 模型抽象基类：规定所有模型必须实现 forward 接口。
 import torch
 
 

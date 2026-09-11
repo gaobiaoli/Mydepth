@@ -167,7 +167,7 @@ def evaluate_zero_shot(
 
 
 def main():
-    from mymodel import PriorBIMDA
+    from model.mymodel import PriorBIMDA
 
     parser = argparse.ArgumentParser(
         description="Zero-shot Matterport3D/BIMNet evaluation"

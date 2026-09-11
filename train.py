@@ -14,8 +14,7 @@ from tqdm import tqdm
 
 from dataset import S23PriorBIMDataset
 from eval import evaluate, move_to
-from loss import priorbim_loss
-from mymodel3 import PriorBIMDA
+from model.mymodel3 import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
 
 
@@ -220,7 +219,7 @@ def main():
                     batch["bim_valid"],
                 )
                 equivariance = changed_scale + log_factor - output["log_scale"]
-                losses = priorbim_loss(output, batch, equivariance)
+                losses = model.compute_loss(output, batch, equivariance)
 
             scaler.scale(losses["total"] / args.accumulation).backward()
             if step % args.accumulation == 0 or step == len(train_loader):

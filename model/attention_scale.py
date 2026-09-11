@@ -1,3 +1,4 @@
+# 注意力尺度模块：通过 BIM/DA3 比值注意力和可选迭代可靠性估计每帧全局尺度。
 from __future__ import annotations
 
 import math
@@ -6,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional
 
-from .blocks import ConvNormAct, ResidualBlock
+from .block import ConvNormAct, ResidualBlock
 
 
 class AttentiveBIMScaleHead(nn.Module):

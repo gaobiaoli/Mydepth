@@ -1,3 +1,4 @@
+# Scale-only 输出模型：保留零初始化 Reassemble 训练分支，但最终深度禁用局部 log-residual。
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,15 +8,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from loss import priorbim_loss
+
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
 BIM_LOG_MEAN = 0.4236631010536673
 BIM_LOG_STD = 0.7573384621476941
 
 
-#计划方案1 强scale 弱refiner, 训练scale后，冻结DINOv2 backbone和neck，训练refiner
-#计划2：合成数据集，利用label = wall,floor 等的区域的gt当成bim prior
-#计划3 r36处，汇总特征后
+#在继承 stage 1 stage2 基础上 零初始化 与 s2相加
 
 def build_bim_condition(da3_depth, bim_depth, bim_valid):
     """Condition used by the zero-initialized DINOv2 patch projection."""
@@ -64,10 +65,6 @@ def build_adapter_condition(da3_depth, bim_depth, bim_valid, log_scale, size):
     ], dim=1)
 
 
-import torch
-import torch.nn as nn
-
-
 class SameResolutionReassemble(nn.Module):
     """
     Reassemble 3 DINOv2 token features without spatial resizing.
@@ -98,7 +95,7 @@ class SameResolutionReassemble(nn.Module):
     def __init__(
         self,
         in_channels=768,
-        stage_channels=(96, 192, 384),
+        stage_channels=(96, 192),
         out_channels=128,
         patch_size=14,
     ):
@@ -127,6 +124,17 @@ class SameResolutionReassemble(nn.Module):
             )
             for hidden_channels in stage_channels
         ])
+        self.adapter = nn.Sequential(
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                bias=True,
+            ),
+        )
+        nn.init.zeros_(self.adapter[0].weight)
+        nn.init.zeros_(self.adapter[0].bias)
 
     def _tokens_to_map(self, tokens, height, width):
         """
@@ -134,7 +142,7 @@ class SameResolutionReassemble(nn.Module):
             -> remove CLS
             -> [B, C, Hp, Wp]
         """
-        B, N_plus_cls, C = tokens.shape
+        B, _, C = tokens.shape
 
         hp = height // self.patch_size
         wp = width // self.patch_size
@@ -164,9 +172,9 @@ class SameResolutionReassemble(nn.Module):
         return feature_map
 
     def forward(self, features, height, width):
-        if len(features) != 3:
+        if len(features) != 2:
             raise ValueError(
-                f"Expected 3 feature maps, got {len(features)}"
+                f"Expected 2 feature maps, got {len(features)}"
             )
 
         projected_features = []
@@ -197,7 +205,7 @@ class SameResolutionReassemble(nn.Module):
         # -> [B, 128, Hp, Wp]
         fused = stacked.mean(dim=0)
 
-        return fused
+        return self.adapter(fused)
 
 
 class ResidualBlock(nn.Module):
@@ -335,7 +343,7 @@ class PriorBIMDA(nn.Module):
         neck = self.dav2.neck
         maps = neck.reassemble_stage(features, height // 14, width // 14)
         projected = [conv(x) for conv, x in zip(neck.convs, maps, strict=True)]
-        myfeatures = self.mymodel(features[:-1], height , width)  # Use features from stages 1, 2, 3
+        myfeatures = self.mymodel(features[:-2], height , width)  # Use features from stages 1, 2, 3
 
         fusion18 = neck.fusion_stage.layers[0]
         f18 = fusion18.projection(fusion18.residual_layer2(projected[3]))
@@ -343,7 +351,7 @@ class PriorBIMDA(nn.Module):
             f18, size=projected[2].shape[-2:], mode="bilinear", align_corners=True
         )
         fusion36 = neck.fusion_stage.layers[1]
-        f36 = top_down + fusion36.residual_layer1(myfeatures)
+        f36 = top_down + fusion36.residual_layer1(projected[2]+myfeatures)
         return fusion36.projection(fusion36.residual_layer2(f36))
 
     def predict_log_scale(self, rgb, da3_depth, bim_depth, bim_valid):
@@ -371,12 +379,13 @@ class PriorBIMDA(nn.Module):
         log_residual_native = 0.1 * torch.tanh(
             self.low2_head(f36 + delta.to(f36.dtype))
         )
-        log_residual = F.interpolate(
-            log_residual_native,
-            size=da3_depth.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
+        # log_residual = F.interpolate(
+        #     log_residual_native,
+        #     size=da3_depth.shape[-2:],
+        #     mode="bilinear",
+        #     align_corners=False,
+        # )
+        log_residual = torch.tensor(0)
 
         scaled_depth = da3_depth.float() * log_scale.exp()
         depth = (scaled_depth * log_residual.float().exp()).clamp(1e-3, 128)
@@ -387,6 +396,10 @@ class PriorBIMDA(nn.Module):
             "log_residual": log_residual,
             "log_residual_native": log_residual_native,
         }
+
+    def compute_loss(self, output, batch, equivariance_error=None):
+        """计算本模型的训练损失，并保持 loss 实现集中在 loss 包中。"""
+        return priorbim_loss(output, batch, equivariance_error)
 
     def parameter_groups(self,factor=1.0):
         """Learning rates from the best six-epoch training run."""

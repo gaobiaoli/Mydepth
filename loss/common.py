@@ -1,3 +1,4 @@
+# 公共损失模块：集中提供 PriorBIMDA 各独立模型共享的尺度、深度与 residual 损失实现。
 from __future__ import annotations
 
 import torch

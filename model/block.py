@@ -1,3 +1,4 @@
+# 模型公共网络块：提供卷积归一化、残差块和上采样融合块。
 from __future__ import annotations
 
 import torch

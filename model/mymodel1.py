@@ -1,3 +1,4 @@
+# Reassemble 替换模型：同分辨率聚合 DINOv2 stage 1/2/3，并替换原 stage-3 F36 分支。
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,11 +8,17 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from loss import priorbim_loss
+
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
 BIM_LOG_MEAN = 0.4236631010536673
 BIM_LOG_STD = 0.7573384621476941
 
+
+#计划方案1 强scale 弱refiner, 训练scale后，冻结DINOv2 backbone和neck，训练refiner
+#计划2：合成数据集，利用label = wall,floor 等的区域的gt当成bim prior
+#计划3 r36处，汇总特征后
 
 def build_bim_condition(da3_depth, bim_depth, bim_valid):
     """Condition used by the zero-initialized DINOv2 patch projection."""
@@ -60,6 +67,138 @@ def build_adapter_condition(da3_depth, bim_depth, bim_valid, log_scale, size):
     ], dim=1)
 
 
+class SameResolutionReassemble(nn.Module):
+    """
+    Reassemble 3 DINOv2 token features without spatial resizing.
+
+    Input:
+        3 × [B, 1 + N, 768]
+        where the first token is CLS.
+
+    Example for 504x504 input and patch_size=14:
+        N = 36 * 36 = 1296
+
+    Pipeline:
+        [B, 1297, 768]
+              ↓ remove CLS token
+        [B, 1296, 768]
+              ↓ reshape
+        [B, 768, 36, 36]
+              ↓ stage-specific 1x1 projection
+        [B, 96/192/384, 36, 36]
+              ↓ 3x3 projection
+        [B, 128, 36, 36]
+
+    Output:
+        mean-fused feature:
+        [B, 128, 36, 36]
+    """
+
+    def __init__(
+        self,
+        in_channels=768,
+        stage_channels=(96, 192, 384),
+        out_channels=128,
+        patch_size=14,
+    ):
+        super().__init__()
+
+        self.patch_size = patch_size
+
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                # DPT-like channel projection
+                nn.Conv2d(
+                    in_channels,
+                    hidden_channels,
+                    kernel_size=1,
+                    bias=True,
+                ),
+
+                # local spatial adaptation + unify channels
+                nn.Conv2d(
+                    hidden_channels,
+                    out_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=True,
+                ),
+            )
+            for hidden_channels in stage_channels
+        ])
+
+    def _tokens_to_map(self, tokens, height, width):
+        """
+        [B, 1+N, C]
+            -> remove CLS
+            -> [B, C, Hp, Wp]
+        """
+        B, _, C = tokens.shape
+
+        hp = height // self.patch_size
+        wp = width // self.patch_size
+
+        expected_tokens = hp * wp
+
+        # Remove CLS token
+        patch_tokens = tokens[:, 1:, :]
+
+        if patch_tokens.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} patch tokens "
+                f"for input {height}x{width}, "
+                f"got {patch_tokens.shape[1]}"
+            )
+
+        # [B, N, C]
+        # -> [B, Hp, Wp, C]
+        # -> [B, C, Hp, Wp]
+        feature_map = (
+            patch_tokens
+            .reshape(B, hp, wp, C)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+
+        return feature_map
+
+    def forward(self, features, height, width):
+        if len(features) != 3:
+            raise ValueError(
+                f"Expected 3 feature maps, got {len(features)}"
+            )
+
+        projected_features = []
+
+        for proj, tokens in zip(
+            self.projections,
+            features,
+            strict=True,
+        ):
+            # DINO tokens -> spatial feature map
+            feat = self._tokens_to_map(
+                tokens,
+                height,
+                width,
+            )
+
+            # stage-specific channel projection
+            feat = proj(feat)
+
+            projected_features.append(feat)
+
+        # [3, B, 128, Hp, Wp]
+        stacked = torch.stack(
+            projected_features,
+            dim=0,
+        )
+
+        # -> [B, 128, Hp, Wp]
+        fused = stacked.mean(dim=0)
+
+        return fused
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels=32):
         super().__init__()
@@ -105,7 +244,7 @@ class PriorBIMDA(nn.Module):
         self.bim_condition_embed = nn.Conv2d(3, 768, 14, stride=14)
         nn.init.zeros_(self.bim_condition_embed.weight)
         nn.init.zeros_(self.bim_condition_embed.bias)
-
+        self.mymodel = SameResolutionReassemble()
         self.scale_head = nn.Sequential(
             nn.LayerNorm(1536),
             nn.Linear(1536, 256),
@@ -195,6 +334,7 @@ class PriorBIMDA(nn.Module):
         neck = self.dav2.neck
         maps = neck.reassemble_stage(features, height // 14, width // 14)
         projected = [conv(x) for conv, x in zip(neck.convs, maps, strict=True)]
+        myfeatures = self.mymodel(features[:-1], height , width)  # Use features from stages 1, 2, 3
 
         fusion18 = neck.fusion_stage.layers[0]
         f18 = fusion18.projection(fusion18.residual_layer2(projected[3]))
@@ -202,13 +342,15 @@ class PriorBIMDA(nn.Module):
             f18, size=projected[2].shape[-2:], mode="bilinear", align_corners=True
         )
         fusion36 = neck.fusion_stage.layers[1]
-        f36 = top_down + fusion36.residual_layer1(projected[2])
+        f36 = top_down + fusion36.residual_layer1(myfeatures)
         return fusion36.projection(fusion36.residual_layer2(f36))
 
     def predict_log_scale(self, rgb, da3_depth, bim_depth, bim_valid):
         condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
         tokens, _ = self._encode(rgb, condition, return_features=False)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
+        # return self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
+        # return self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
         return self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
 
     def forward(self, rgb, da3_depth, bim_depth, bim_valid):
@@ -216,6 +358,8 @@ class PriorBIMDA(nn.Module):
         tokens, features = self._encode(rgb, condition)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
         log_scale = self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
+        # log_scale = self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
+        # log_scale = self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
 
         f36 = self._decode_f36(features, rgb.shape[-2], rgb.shape[-1])
         adapter_input = build_adapter_condition(
@@ -242,6 +386,10 @@ class PriorBIMDA(nn.Module):
             "log_residual": log_residual,
             "log_residual_native": log_residual_native,
         }
+
+    def compute_loss(self, output, batch, equivariance_error=None):
+        """计算本模型的训练损失，并保持 loss 实现集中在 loss 包中。"""
+        return priorbim_loss(output, batch, equivariance_error)
 
     def parameter_groups(self,factor=1.0):
         """Learning rates from the best six-epoch training run."""

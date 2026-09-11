@@ -8,7 +8,7 @@
 - 用户给出的 `~/ouputs` 不存在；本报告按实际目录 `/home/bgao491/outputs` 汇总。
 - 早期基线另存于项目内的 `/home/bgao491/MyDepth/outputs`，也纳入比较。
 - 实验与代码的对应关系由输出时间、`train.py` 当时的模型 import/默认输出目录、本地 VS Code 文件历史，以及 checkpoint 大小共同还原。
-- 当前实验代码没有被 Git 跟踪，checkpoint 也没有保存源码 hash 或完整运行参数。因此下面的对应关系有充分的本机历史依据，但早期基线与后续复跑之间的所有细微差异无法做到严格的字节级复现。
+- checkpoint 没有保存源码 hash 或完整运行参数，相关源码也是在实验完成后才统一纳入 Git。因此下面的对应关系有充分的本机历史依据，但早期基线与后续复跑之间的所有细微差异无法做到严格的字节级复现。
 
 指标方向：AbsRel、RMSE 越低越好（↓），δ1 越高越好（↑）。表中数值统一保留 5 位小数。
 
@@ -16,14 +16,14 @@
 
 | 实验结果目录 | 对应代码/运行态 | 相对上一方案的具体改动 | 状态 |
 |---|---|---|---|
-| `MyDepth/outputs/adapter_3resblocks_raw` + `MyDepth/outputs/zero_shot_raw` | [`model.py`](model.py)，功能上也等同于当前 [`mymodel.py`](mymodel.py) | 原始基线：CLS 与 patch 均值拼接预测全局尺度；保留原 DAv2 F36 解码路径；BIM disagreement adapter 含 3 个 ResBlock，并预测局部 log-residual | Area1 训练和零样本完成；缺少 `test_metrics.json` |
+| `MyDepth/outputs/adapter_3resblocks_raw` + `MyDepth/outputs/zero_shot_raw` | [`model/baseline.py`](model/baseline.py)，功能上也等同于当前 [`model/mymodel.py`](model/mymodel.py) | 原始基线：CLS 与 patch 均值拼接预测全局尺度；保留原 DAv2 F36 解码路径；BIM disagreement adapter 含 3 个 ResBlock，并预测局部 log-residual | Area1 训练和零样本完成；缺少 `test_metrics.json` |
 | `~/outputs/scale_cls` | `mymodel.py` 的历史运行态 | scale descriptor 从 `CLS + mean(patch)` 改成仅 CLS；scale head 输入维度由 1536 改为 768 | 完成 |
 | `~/outputs/scale_mean` | `mymodel.py` 的历史运行态 | 在 `scale_cls` 基础上改成仅使用所有 patch token 的均值，不再使用 CLS | 完成 |
-| `~/outputs/scale_raw` | [`model.py`](model.py) | 恢复 `CLS + mean(patch)` 拼接，scale head 输入恢复为 1536；其余训练设置仍为 batch 2、梯度累积 8 | 完成 |
-| `~/outputs/scale_raw1` | [`model.py`](model.py) | 模型结构不变；物理 batch 从 2 改为 8，累积从 8 改为 2（有效 batch 都是 16）；增加确定性设置，关闭 gradient checkpointing，并增加 tqdm 显示 | 完成 |
-| `~/outputs/Reassemble` | [`mymodel1.py`](mymodel1.py) | 新增 same-resolution reassemble：取 DINOv2 stage 1/2/3 token，不做空间缩放，各自经 `1×1 + 3×3` 投影到 128 通道后取均值；在 F36 融合处用它替换原 stage-3 分支 | 完成 |
-| `~/outputs/Reassemble_zero_init_12plus3` | [`mymodel2.py`](mymodel2.py) | reassemble 改为只取 stage 1/2；均值融合后经过零初始化 `3×3` adapter，再以 residual 形式加到原 stage-3 分支，避免训练初始时破坏原路径 | 完成 |
-| `~/outputs/Reassemble_only_scale` | [`mymodel3.py`](mymodel3.py) | 保留上一方案的网络计算，但把上采样后的 `log_residual` 强制设为 0，因此最终深度等于仅做全局尺度校正的深度 | 6 epoch、测试和零样本均完成 |
+| `~/outputs/scale_raw` | [`model/baseline.py`](model/baseline.py) | 恢复 `CLS + mean(patch)` 拼接，scale head 输入恢复为 1536；其余训练设置仍为 batch 2、梯度累积 8 | 完成 |
+| `~/outputs/scale_raw1` | [`model/baseline.py`](model/baseline.py) | 模型结构不变；物理 batch 从 2 改为 8，累积从 8 改为 2（有效 batch 都是 16）；增加确定性设置，关闭 gradient checkpointing，并增加 tqdm 显示 | 完成 |
+| `~/outputs/Reassemble` | [`model/mymodel1.py`](model/mymodel1.py) | 新增 same-resolution reassemble：取 DINOv2 stage 1/2/3 token，不做空间缩放，各自经 `1×1 + 3×3` 投影到 128 通道后取均值；在 F36 融合处用它替换原 stage-3 分支 | 完成 |
+| `~/outputs/Reassemble_zero_init_12plus3` | [`model/mymodel2.py`](model/mymodel2.py) | reassemble 改为只取 stage 1/2；均值融合后经过零初始化 `3×3` adapter，再以 residual 形式加到原 stage-3 分支，避免训练初始时破坏原路径 | 完成 |
+| `~/outputs/Reassemble_only_scale` | [`model/mymodel3.py`](model/mymodel3.py) | 保留上一方案的网络计算，但把上采样后的 `log_residual` 强制设为 0，因此最终深度等于仅做全局尺度校正的深度 | 6 epoch、测试和零样本均完成 |
 
 ## 3. 共同模型与训练设置
 
@@ -37,7 +37,7 @@
 6. 训练目标为：`depth + 0.5×scale + 0.5×residual + 0.1×zero_mean + 0.1×equivariance`。
 7. Area1 默认训练 6 epoch；训练集按 room 频次的 `count^-0.5` 加权采样；最优 checkpoint 按 validation final AbsRel 选择。
 
-注意：`mymodel3.py` 只在最终输出处禁用了 residual，但仍然计算 `log_residual_native`，而且 residual 辅助损失和对应参数仍参与训练。因此 `Reassemble_only_scale` 是“输出仅 scale”，不是“删除 refiner、只训练 scale head”的严格消融。
+注意：`model/mymodel3.py` 只在最终输出处禁用了 residual，但仍然计算 `log_residual_native`，而且 residual 辅助损失和对应参数仍参与训练。因此 `Reassemble_only_scale` 是“输出仅 scale”，不是“删除 refiner、只训练 scale head”的严格消融。
 
 ## 4. Area1 validation/test 结果
 
@@ -164,9 +164,9 @@
 
 ## 9. 当前代码与复现注意事项
 
-- 当前 Git 只有一次提交；`eval.py`、`loss.py`、`model.py`、`mymodel*.py`、`train.py`、`zero_shot_eval.py` 和 `model/` 目录都仍是未跟踪文件。
-- 当前 [`train.py`](train.py) 默认导入 `mymodel3.PriorBIMDA`，默认输出到 `outputs/Reassemble_only_scale`。直接再次运行会复用同一路径，存在覆盖/混合结果的风险。
-- [`eval.py`](eval.py) 的独立 CLI 固定导入 `model.PriorBIMDA`，不能直接加载 reassemble checkpoint；训练结束时的内嵌评测没有这个问题，因为它使用内存中的正确模型实例。
-- [`zero_shot_eval.py`](zero_shot_eval.py) 的独立 CLI 也固定导入 `mymodel.PriorBIMDA`；同样不适用于 reassemble checkpoint，但由 `train.py` 调用 `evaluate_zero_shot(model, ...)` 时使用的是正确实例。
+- 实验源码已在提交 `44957c1` 中纳入 Git；本次把根目录模型和 loss 重组到 `model/`、`loss/` 的改动仍位于工作树、尚未提交。
+- 当前 [`train.py`](train.py) 默认导入 `model.mymodel3.PriorBIMDA`，默认输出到 `outputs/Reassemble_only_scale`。直接再次运行会复用同一路径，存在覆盖/混合结果的风险。
+- [`eval.py`](eval.py) 的独立 CLI 固定导入 `model.baseline.PriorBIMDA`，不能直接加载 reassemble checkpoint；训练结束时的内嵌评测没有这个问题，因为它使用内存中的正确模型实例。
+- [`zero_shot_eval.py`](zero_shot_eval.py) 的独立 CLI 固定导入 `model.mymodel.PriorBIMDA`；同样不适用于 reassemble checkpoint，但由 `train.py` 调用 `evaluate_zero_shot(model, ...)` 时使用的是正确实例。
 - [`model/attention_scale.py`](model/attention_scale.py) 目前没有被上述训练入口引用，因此 `/home/bgao491/outputs` 中没有可明确对应给它的实验结果。
 - 后续每次实验建议在输出目录额外保存：模型文件名、完整 CLI args、Git commit/dirty diff、源码 SHA256、随机种子、PyTorch/CUDA 版本。这样无需再依赖编辑器历史推断对应关系。

@@ -6,7 +6,7 @@ import json
 import torch
 
 from dataset import build_area1_dataloader
-from model import PriorBIMDA
+from model.baseline import PriorBIMDA
 
 
 def move_to(batch, device):

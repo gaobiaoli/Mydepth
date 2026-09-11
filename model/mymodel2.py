@@ -1,3 +1,4 @@
+# 零初始化 Reassemble 模型：聚合 stage 1/2，经零初始化 adapter 后残差叠加到原 stage-3 分支。
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -6,6 +7,8 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from loss import priorbim_loss
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
@@ -60,10 +63,6 @@ def build_adapter_condition(da3_depth, bim_depth, bim_valid, log_scale, size):
         masked_pool((z.abs() / 1.5).clamp(0, 1)),
         pooled_mask,
     ], dim=1)
-
-
-import torch
-import torch.nn as nn
 
 
 class SameResolutionReassemble(nn.Module):
@@ -143,7 +142,7 @@ class SameResolutionReassemble(nn.Module):
             -> remove CLS
             -> [B, C, Hp, Wp]
         """
-        B, N_plus_cls, C = tokens.shape
+        B, _, C = tokens.shape
 
         hp = height // self.patch_size
         wp = width // self.patch_size
@@ -396,6 +395,10 @@ class PriorBIMDA(nn.Module):
             "log_residual": log_residual,
             "log_residual_native": log_residual_native,
         }
+
+    def compute_loss(self, output, batch, equivariance_error=None):
+        """计算本模型的训练损失，并保持 loss 实现集中在 loss 包中。"""
+        return priorbim_loss(output, batch, equivariance_error)
 
     def parameter_groups(self,factor=1.0):
         """Learning rates from the best six-epoch training run."""

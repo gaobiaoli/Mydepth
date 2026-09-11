@@ -1,3 +1,4 @@
+# 基线模型：CLS 与 patch 均值联合预测全局尺度，并用三层 BIM disagreement adapter 预测局部 residual。
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,15 +8,13 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from loss import priorbim_loss
+
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
 BIM_LOG_MEAN = 0.4236631010536673
 BIM_LOG_STD = 0.7573384621476941
 
-
-#计划方案1 强scale 弱refiner, 训练scale后，冻结DINOv2 backbone和neck，训练refiner
-#计划2：合成数据集，利用label = wall,floor 等的区域的gt当成bim prior
-#计划3 r36处，汇总特征后
 
 def build_bim_condition(da3_depth, bim_depth, bim_valid):
     """Condition used by the zero-initialized DINOv2 patch projection."""
@@ -213,8 +212,6 @@ class PriorBIMDA(nn.Module):
         condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
         tokens, _ = self._encode(rgb, condition, return_features=False)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
-        # return self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
-        # return self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
         return self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
 
     def forward(self, rgb, da3_depth, bim_depth, bim_valid):
@@ -222,8 +219,6 @@ class PriorBIMDA(nn.Module):
         tokens, features = self._encode(rgb, condition)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
         log_scale = self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
-        # log_scale = self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
-        # log_scale = self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
 
         f36 = self._decode_f36(features, rgb.shape[-2], rgb.shape[-1])
         adapter_input = build_adapter_condition(
@@ -250,6 +245,10 @@ class PriorBIMDA(nn.Module):
             "log_residual": log_residual,
             "log_residual_native": log_residual_native,
         }
+
+    def compute_loss(self, output, batch, equivariance_error=None):
+        """计算本模型的训练损失，并保持 loss 实现集中在 loss 包中。"""
+        return priorbim_loss(output, batch, equivariance_error)
 
     def parameter_groups(self,factor=1.0):
         """Learning rates from the best six-epoch training run."""
