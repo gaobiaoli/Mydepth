@@ -44,6 +44,18 @@ def depth_weights(batch):
 
     if "furniture_mask" in batch:
         weight = weight + (batch["furniture_mask"] > 0).float()
+    elif "semantic_labels" in batch:
+        FURNITURE_CLASS_IDS = torch.tensor(
+        [7, 8, 9, 10],
+        device=batch["semantic_labels"].device,
+        dtype=torch.int32,
+        )
+
+        furniture_mask = torch.isin(
+            batch["semantic_labels"],
+            FURNITURE_CLASS_IDS,
+            )
+        weight = weight + furniture_mask.float()
 
     tolerance = torch.maximum(torch.full_like(batch["bim_depth"], 0.10),
                               0.05 * batch["bim_depth"])

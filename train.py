@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import random
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -38,7 +39,13 @@ def seed_everything(seed,deterministic=True):
         torch.backends.cudnn.deterministic = False
         torch.use_deterministic_algorithms(False)
 
-def build_loaders(args, generator):
+def seed_worker(worker_id):
+    del worker_id
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+def build_loaders(args, sampler_generator,train_worker_generator):
     train_set = S23PriorBIMDataset(
         args.dataset_root,
         args.s23_root,
@@ -53,17 +60,18 @@ def build_loaders(args, generator):
     counts = Counter(record["region"] for record in train_set.records)
     weights = [counts[record["region"]] ** -0.5 for record in train_set.records]
     sampler = WeightedRandomSampler(
-        weights, len(weights), replacement=True, generator=generator
+        weights, len(weights), replacement=True, generator=sampler_generator
     )
     common = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
         "pin_memory": torch.cuda.is_available(),
         "persistent_workers": False,
+        "worker_init_fn": seed_worker,
     }
-    train_loader = DataLoader(train_set, sampler=sampler, drop_last=True, **common)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **common)
-    test_loader = DataLoader(test_set, shuffle=False, drop_last=False, **common)
+    train_loader = DataLoader(train_set, sampler=sampler,generator=train_worker_generator, drop_last=True, **common)
+    val_loader = DataLoader(val_set, shuffle=False,generator=torch.Generator().manual_seed(args.seed), drop_last=False, **common)
+    test_loader = DataLoader(test_set, shuffle=False,generator=torch.Generator().manual_seed(args.seed), drop_last=False, **common)
     return train_loader, val_loader, test_loader
 
 
@@ -128,7 +136,7 @@ def main():
     )
     parser.add_argument("--s23-root", default="/home/bgao491/Stanford2D3DS/no_xyz")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--output", default="outputs/raw3")
+    parser.add_argument("--output", default="outputs/raw4")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--accumulation", type=int, default=2)
@@ -149,8 +157,15 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    generator = torch.Generator().manual_seed(args.seed)
-    train_loader, val_loader, test_loader = build_loaders(args, generator)
+    sampler_generator = torch.Generator().manual_seed(args.seed)
+    train_worker_generator = torch.Generator().manual_seed(args.seed + 1)
+
+    train_loader, val_loader, test_loader = build_loaders(
+        args,
+        sampler_generator,
+        train_worker_generator,
+    )
+
 
     model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only).to(
         device
@@ -179,7 +194,10 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_seed = (args.seed + (epoch - 1) * 1_000_003) % 2**32
         seed_everything(epoch_seed)
-        generator.manual_seed(epoch_seed)
+        sampler_generator.manual_seed(epoch_seed)
+        train_worker_generator.manual_seed(
+            (epoch_seed + 1) % 2**32
+        )
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0

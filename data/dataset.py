@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-
+from s3dis_sam3d import decode_semantic_labels
 from .transform import (
     Compose,
     RandomBIMEdgeDilation,
@@ -22,6 +22,13 @@ from .transform import (
     RandomRGBGainBias,
 )
 
+def to_semancit_path(rgb_path):
+    semantic_path = (
+    rgb_path.parent.parent
+    / "semantic"
+    / rgb_path.name.replace("_rgb.png", "_semantic.png")
+)
+    return semantic_path
 
 transform = Compose(
     [
@@ -245,6 +252,28 @@ class S23PriorBIMDataset(Dataset):
     # NPZ
     # =============================================================
 
+    def _load_semantic(
+        self,
+        path: Path,
+    ) -> np.ndarray:
+        semantic = decode_semantic_labels(path)
+
+        if semantic.ndim != 2:
+            raise ValueError(
+                f"Semantic label must be HxW, got {semantic.shape}"
+            )
+
+        if semantic.shape != (self.height, self.width):
+            # Semantic labels are categorical:
+            # nearest-neighbour interpolation only.
+            semantic = cv2.resize(
+                semantic.astype(np.float32),
+                (self.width, self.height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.int32)
+
+        return np.ascontiguousarray(semantic)
+
     def _load_sample(
         self,
         path: Path,
@@ -399,10 +428,13 @@ class S23PriorBIMDataset(Dataset):
         sample_path = self._sample_path(record)
 
         rgb_path = self._rgb_path(record)
+        semantic_path = to_semancit_path(rgb_path)
+        semantic_labels = self._load_semantic(semantic_path)
 
         arrays = self._load_sample(sample_path)
 
         arrays["rgb"] = self._load_rgb(rgb_path)
+        arrays["semantic_labels"] = semantic_labels
 
         if self.augment:
             arrays = self._augment(arrays)

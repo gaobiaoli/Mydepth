@@ -276,7 +276,7 @@ class PriorBIMDA(nn.Module):
             "rgb_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
             persistent=False,
         )
-
+        
     @classmethod
     def from_pretrained(cls, local_files_only=False):
         from transformers import AutoModelForDepthEstimation
