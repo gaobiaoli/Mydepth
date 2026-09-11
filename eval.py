@@ -5,7 +5,7 @@ import json
 
 import torch
 
-from dataset import build_area1_dataloader
+from data import build_area1_dataloader
 from model.baseline import PriorBIMDA
 
 

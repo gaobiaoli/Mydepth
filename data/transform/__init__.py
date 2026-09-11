@@ -4,19 +4,16 @@ from .base import (
     Sample,
     Transform,
 )
-
-from .photometric import (
-    RandomGamma,
-    RandomRGBGainBias,
-    RandomRGBGaussianNoise,
-)
-
 from .geometric import (
     RandomCrop,
     RandomHorizontalFlip,
     Resize,
 )
-
+from .photometric import (
+    RandomGamma,
+    RandomRGBGainBias,
+    RandomRGBGaussianNoise,
+)
 from .prior import (
     RandomBIMDropout,
     RandomBIMLogNoise,
@@ -25,28 +22,20 @@ from .prior import (
     RandomBIMShift,
 )
 
-
 __all__ = [
-    # base
-    "Sample",
-    "Transform",
     "Compose",
     "Identity",
-
-    # photometric
-    "RandomRGBGainBias",
-    "RandomGamma",
-    "RandomRGBGaussianNoise",
-
-    # geometric
-    "RandomHorizontalFlip",
-    "RandomCrop",
-    "Resize",
-
-    # prior
-    "RandomBIMScale",
-    "RandomBIMLogNoise",
     "RandomBIMDropout",
+    "RandomBIMLogNoise",
     "RandomBIMRectHole",
+    "RandomBIMScale",
     "RandomBIMShift",
+    "RandomCrop",
+    "RandomGamma",
+    "RandomHorizontalFlip",
+    "RandomRGBGainBias",
+    "RandomRGBGaussianNoise",
+    "Resize",
+    "Sample",
+    "Transform",
 ]

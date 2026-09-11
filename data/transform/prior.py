@@ -271,12 +271,12 @@ class RandomBIMRectHole(Transform):
 
             hole_h = max(
                 1,
-                int(round(H * frac_h)),
+                round(H * frac_h),
             )
 
             hole_w = max(
                 1,
-                int(round(W * frac_w)),
+                round(W * frac_w),
             )
 
             y0 = int(

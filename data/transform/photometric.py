@@ -77,7 +77,9 @@ class RandomRGBGainBias(Transform):
         rng: np.random.Generator,
     ) -> Sample:
 
-        if rng.random() >= self.p:
+        # p=1 时不额外消耗随机数，使 dataset 的 gain/bias/flip 抽样
+        # 顺序与迁移到 transform 模块前完全一致。
+        if self.p < 1.0 and rng.random() >= self.p:
             return sample
 
         rgb = _validate_rgb(

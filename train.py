@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
-from dataset import S23PriorBIMDataset
+from data import S23PriorBIMDataset
 from eval import evaluate, move_to
 from model.mymodel3 import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
