@@ -6,12 +6,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 export PYTHONHASHSEED=42
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
-for run_id in 8 9; do
+for run_id in 11 12; do
     output_dir="outputs/raw${run_id}"
 
     echo "[$(date '+%F %T')] 开始训练：${output_dir}"
     python -u train.py \
-        --seed 42 \
+        --seed 40 \
         --full-deterministic \
         --output "${output_dir}"
 

@@ -81,6 +81,136 @@ def seed_everything(seed, deterministic=True, full_deterministic=False):
         torch.use_deterministic_algorithms(False)
 
 
+
+def configure_full_deterministic_model_trainable(
+    model,
+    target_height: int = 504,
+    target_width: int = 504,
+):
+    """
+    Keep DINOv2 positional embeddings trainable while removing the
+    nondeterministic CUDA bicubic-interpolation backward path.
+
+    The pretrained positional embeddings are resized ONCE to the target
+    patch grid under no_grad(), then re-registered as a trainable Parameter.
+
+    For 504x504 input with patch_size=14:
+        504 / 14 = 36
+    so the new positional embedding has shape:
+        [1, 1 + 36*36, hidden_dim]
+
+    Important:
+    - Call this BEFORE constructing the optimizer.
+    - Prefer calling it AFTER model.to(device), so the one-time interpolation
+      uses the same device/kernel as normal DINOv2 forward interpolation.
+    - Training should remain at this target patch grid. Inference may still
+      use other resolutions; DINOv2 can interpolate this learned PE again.
+    """
+    embeddings = model.dav2.backbone.embeddings
+    position_embeddings = embeddings.position_embeddings
+
+    if position_embeddings.ndim != 3 or position_embeddings.shape[0] != 1:
+        raise ValueError(
+            "Expected DINOv2 position_embeddings with shape [1, N, C], "
+            f"got {tuple(position_embeddings.shape)}"
+        )
+
+    # Infer patch size directly from the patch projection Conv2d.
+    projection = embeddings.patch_embeddings.projection
+
+    patch_size = projection.kernel_size
+    if isinstance(patch_size, int):
+        patch_h = patch_w = patch_size
+    else:
+        patch_h, patch_w = patch_size
+
+    if target_height % patch_h != 0 or target_width % patch_w != 0:
+        raise ValueError(
+            f"Target resolution {(target_height, target_width)} must be "
+            f"divisible by patch size {(patch_h, patch_w)}"
+        )
+
+    target_grid_h = target_height // patch_h
+    target_grid_w = target_width // patch_w
+
+    # Original pretrained positional grid.
+    num_source_patches = position_embeddings.shape[1] - 1
+    source_grid = math.isqrt(num_source_patches)
+
+    if source_grid * source_grid != num_source_patches:
+        raise ValueError(
+            "Expected a square pretrained positional grid, but got "
+            f"{num_source_patches} patch positions."
+        )
+
+    hidden_dim = position_embeddings.shape[-1]
+    original_dtype = position_embeddings.dtype
+    original_device = position_embeddings.device
+
+    with torch.no_grad():
+        # Keep CLS positional embedding unchanged.
+        cls_pos = position_embeddings[:, :1].float()
+
+        # [1, N, C] -> [1, C, H0, W0]
+        patch_pos = position_embeddings[:, 1:].float()
+        patch_pos = patch_pos.reshape(
+            1,
+            source_grid,
+            source_grid,
+            hidden_dim,
+        ).permute(0, 3, 1, 2)
+
+        # One-time interpolation.
+        # No backward graph is created here.
+        patch_pos = torch.nn.functional.interpolate(
+            patch_pos,
+            size=(target_grid_h, target_grid_w),
+            mode="bicubic",
+            align_corners=False,
+        )
+
+        # [1, C, H, W] -> [1, H*W, C]
+        patch_pos = patch_pos.permute(
+            0, 2, 3, 1
+        ).reshape(
+            1,
+            target_grid_h * target_grid_w,
+            hidden_dim,
+        )
+
+        resized_pos = torch.cat(
+            [cls_pos, patch_pos],
+            dim=1,
+        ).to(
+            device=original_device,
+            dtype=original_dtype,
+        )
+
+    # Critical:
+    # Re-register as TRAINABLE parameter.
+    embeddings.position_embeddings = torch.nn.Parameter(
+        resized_pos.contiguous(),
+        requires_grad=True,
+    )
+
+    expected_tokens = 1 + target_grid_h * target_grid_w
+
+    if embeddings.position_embeddings.shape[1] != expected_tokens:
+        raise RuntimeError(
+            "Unexpected resized positional embedding shape: "
+            f"{tuple(embeddings.position_embeddings.shape)}"
+        )
+
+    print(
+        "DINOv2 positional embeddings pre-resized: "
+        f"{source_grid}x{source_grid} -> "
+        f"{target_grid_h}x{target_grid_w}; "
+        "position embeddings remain trainable.",
+        flush=True,
+    )
+
+
+
 def configure_full_deterministic_model(model):
     """Remove the trainable bicubic CUDA backward path in DINOv2."""
     position_embeddings = model.dav2.backbone.embeddings.position_embeddings
@@ -228,16 +358,17 @@ def main():
 
 
     model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only)
+    model = model.to(
+            device,
+        )
     if args.full_deterministic:
-        configure_full_deterministic_model(model)
+        configure_full_deterministic_model_trainable(model)
         print(
             "Full deterministic mode: strict algorithms, Math SDP only, "
             "TF32 disabled, DINOv2 position embeddings frozen",
             flush=True,
         )
-    model = model.to(
-        device,
-    )
+    
     # model.enable_gradient_checkpointing()
     optimizer = torch.optim.AdamW(
         model.parameter_groups(factor=1.0), weight_decay=0.01
