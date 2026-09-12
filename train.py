@@ -7,6 +7,7 @@ import os
 import random
 from collections import Counter
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import torch
@@ -210,6 +211,166 @@ def configure_full_deterministic_model_trainable(
     )
 
 
+def _bicubic_kernel(distance: torch.Tensor) -> torch.Tensor:
+    """PyTorch bicubic convolution kernel (a = -0.75)."""
+    coefficient = -0.75
+    distance = distance.abs()
+    inner = (
+        (coefficient + 2.0) * distance**3
+        - (coefficient + 3.0) * distance**2
+        + 1.0
+    )
+    outer = (
+        coefficient * distance**3
+        - 5.0 * coefficient * distance**2
+        + 8.0 * coefficient * distance
+        - 4.0 * coefficient
+    )
+    return torch.where(
+        distance <= 1.0,
+        inner,
+        torch.where(distance < 2.0, outer, torch.zeros_like(distance)),
+    )
+
+
+def _build_bicubic_interpolation_matrix(
+    source_size: int,
+    target_size: int,
+) -> torch.Tensor:
+    """Build the align_corners=False 1-D bicubic resize matrix on CPU."""
+    if source_size <= 0 or target_size <= 0:
+        raise ValueError(
+            f"Interpolation sizes must be positive, got {source_size} -> "
+            f"{target_size}."
+        )
+    if source_size == target_size:
+        return torch.eye(source_size, dtype=torch.float32)
+
+    scale = source_size / target_size
+    target_coordinates = torch.arange(target_size, dtype=torch.float32)
+    source_coordinates = (target_coordinates + 0.5) * scale - 0.5
+    source_floor = torch.floor(source_coordinates).to(torch.long)
+    offsets = torch.arange(-1, 3, dtype=torch.long)
+    source_indices = source_floor[:, None] + offsets[None, :]
+    weights = _bicubic_kernel(
+        source_coordinates[:, None] - source_indices.to(torch.float32)
+    )
+
+    # Bicubic uses border replication outside the source grid.
+    source_indices.clamp_(0, source_size - 1)
+    matrix = torch.zeros(target_size, source_size, dtype=torch.float32)
+    rows = torch.arange(target_size)
+    for column in range(4):
+        matrix[rows, source_indices[:, column]] += weights[:, column]
+    return matrix
+
+
+def configure_full_deterministic_model_matrix_interpolation(model):
+    """
+    Keep the original DINOv2 position embedding trainable and replace its
+    bicubic resize with separable deterministic matrix multiplications.
+
+    Each interpolation matrix is built once per source/target size and device,
+    then cached. The position embedding remains the original model parameter.
+    """
+    embeddings = model.dav2.backbone.embeddings
+    position_embeddings = embeddings.position_embeddings
+    num_source_patches = position_embeddings.shape[1] - 1
+    source_grid = math.isqrt(num_source_patches)
+    if source_grid * source_grid != num_source_patches:
+        raise ValueError(
+            "Expected a square pretrained positional grid, but got "
+            f"{num_source_patches} patch positions."
+        )
+
+    matrix_cache = {}
+
+    def interpolation_matrix(source_size, target_size, device):
+        key = (source_size, target_size, device.type, device.index)
+        matrix = matrix_cache.get(key)
+        if matrix is None:
+            matrix = _build_bicubic_interpolation_matrix(
+                source_size,
+                target_size,
+            ).to(device=device)
+            matrix_cache[key] = matrix
+        return matrix
+
+    def interpolate_pos_encoding(self, tokens, height, width):
+        num_patches = tokens.shape[1] - 1
+        num_positions = self.position_embeddings.shape[1] - 1
+        if (
+            not torch.jit.is_tracing()
+            and num_patches == num_positions
+            and height == width
+        ):
+            return self.position_embeddings
+
+        patch_size = self.patch_size
+        if isinstance(patch_size, int):
+            patch_height = patch_width = patch_size
+        else:
+            patch_height, patch_width = patch_size
+        target_grid_height = height // patch_height
+        target_grid_width = width // patch_width
+
+        current_source_grid = math.isqrt(num_positions)
+        if current_source_grid * current_source_grid != num_positions:
+            raise ValueError(
+                "Expected a square positional grid, but got "
+                f"{num_positions} patch positions."
+            )
+
+        cls_pos = self.position_embeddings[:, :1]
+        patch_pos = self.position_embeddings[:, 1:]
+        hidden_dim = patch_pos.shape[-1]
+        target_dtype = patch_pos.dtype
+        patch_pos = patch_pos.reshape(
+            1,
+            current_source_grid,
+            current_source_grid,
+            hidden_dim,
+        ).permute(0, 3, 1, 2)
+
+        # DINOv2 interpolates position embeddings in float32. Disable autocast
+        # explicitly so the matrix path preserves that behaviour.
+        with torch.autocast(device_type=patch_pos.device.type, enabled=False):
+            height_matrix = interpolation_matrix(
+                current_source_grid,
+                target_grid_height,
+                patch_pos.device,
+            )
+            width_matrix = interpolation_matrix(
+                current_source_grid,
+                target_grid_width,
+                patch_pos.device,
+            )
+            resized_pos = torch.matmul(height_matrix, patch_pos.float())
+            resized_pos = torch.matmul(
+                resized_pos,
+                width_matrix.transpose(0, 1),
+            )
+
+        resized_pos = resized_pos.to(dtype=target_dtype)
+        resized_pos = resized_pos.permute(0, 2, 3, 1).reshape(
+            1,
+            target_grid_height * target_grid_width,
+            hidden_dim,
+        )
+        return torch.cat((cls_pos, resized_pos), dim=1)
+
+    embeddings.interpolate_pos_encoding = MethodType(
+        interpolate_pos_encoding,
+        embeddings,
+    )
+    position_embeddings.requires_grad_(True)
+    print(
+        "DINOv2 positional interpolation replaced with cached bicubic "
+        f"matrices; original {source_grid}x{source_grid} position embedding "
+        "remains trainable.",
+        flush=True,
+    )
+
 
 def configure_full_deterministic_model(model):
     """Remove the trainable bicubic CUDA backward path in DINOv2."""
@@ -326,8 +487,8 @@ def main():
         "--full-deterministic",
         action="store_true",
         help=(
-            "enable strict deterministic algorithms, Math SDP only, no TF32, "
-            "and freeze DINOv2 position embeddings"
+            "enable strict deterministic algorithms and replace DINOv2 "
+            "bicubic position interpolation with deterministic matmuls"
         ),
     )
     parser.add_argument("--local-files-only", action="store_true")
@@ -362,10 +523,10 @@ def main():
             device,
         )
     if args.full_deterministic:
-        configure_full_deterministic_model_trainable(model)
+        configure_full_deterministic_model_matrix_interpolation(model)
         print(
-            "Full deterministic mode: strict algorithms, Math SDP only, "
-            "TF32 disabled, DINOv2 position embeddings frozen",
+            "Full deterministic mode: strict algorithms and deterministic "
+            "DINOv2 position interpolation; position embeddings trainable",
             flush=True,
         )
     
