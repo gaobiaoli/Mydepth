@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 import os
+import random
 from collections import Counter
 from pathlib import Path
 
@@ -13,13 +13,24 @@ import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
+# from MyDepth import loss
 from data import S23PriorBIMDataset
 from eval import evaluate, move_to
 from model.mymodel import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
 
 
-def seed_everything(seed,deterministic=True):
+def seed_everything(seed, deterministic=True, full_deterministic=False):
+    """Seed all RNGs and optionally enable the strict deterministic profile."""
+    if full_deterministic:
+        deterministic = True
+        if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in {":4096:8", ":16:8"}:
+            # This is set before the first CUDA operation in main().
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        # This affects child processes. For the main interpreter, set the same
+        # variable before launching Python (train.sh already does this).
+        os.environ.setdefault("PYTHONHASHSEED", str(seed))
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -30,20 +41,58 @@ def seed_everything(seed,deterministic=True):
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
 
-        # 强制 PyTorch 使用确定性算法
-        # 若某算子不存在确定性实现，直接报错
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        # The default profile preserves the previous warn-only behaviour. The
+        # full profile fails immediately if a nondeterministic kernel remains.
+        torch.use_deterministic_algorithms(
+            True,
+            # warn_only=not full_deterministic,
+            warn_only=not full_deterministic,
+        )
+
+        if full_deterministic:
+            pass
+            # torch.set_deterministic_debug_mode("error")
+            # torch.backends.cuda.matmul.allow_tf32 = False
+            # torch.backends.cudnn.allow_tf32 = False
+            # torch.set_float32_matmul_precision("highest")
+            # torch.backends.cuda.enable_flash_sdp(False)
+            # torch.backends.cuda.enable_mem_efficient_sdp(False)
+            # torch.backends.cuda.enable_math_sdp(True)
+            # if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            #     torch.backends.cuda.enable_cudnn_sdp(False)
+            # if hasattr(
+            #     torch.backends.cuda.matmul,
+            #     "allow_fp16_reduced_precision_reduction",
+            # ):
+            #     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+            #         False
+            #     )
+            # if hasattr(
+            #     torch.backends.cuda.matmul,
+            #     "allow_bf16_reduced_precision_reduction",
+            # ):
+            #     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+            #         False
+            #     )
 
     else:
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
         torch.use_deterministic_algorithms(False)
 
+
+def configure_full_deterministic_model(model):
+    """Remove the trainable bicubic CUDA backward path in DINOv2."""
+    position_embeddings = model.dav2.backbone.embeddings.position_embeddings
+    position_embeddings.requires_grad_(False)
+
+
 def seed_worker(worker_id):
     del worker_id
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
 
 def build_loaders(args, sampler_generator,train_worker_generator):
     train_set = S23PriorBIMDataset(
@@ -138,11 +187,19 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--output", default="outputs/raw4")
     parser.add_argument("--epochs", type=int, default=6)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--accumulation", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--accumulation", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--full-deterministic",
+        action="store_true",
+        help=(
+            "enable strict deterministic algorithms, Math SDP only, no TF32, "
+            "and freeze DINOv2 position embeddings"
+        ),
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--zero-shot",
@@ -151,8 +208,11 @@ def main():
         help="run zero-shot evaluation after the Area1 test split",
     )
     args = parser.parse_args()
-
-    seed_everything(args.seed)
+    # loss_log = []
+    seed_everything(
+        args.seed,
+        full_deterministic=args.full_deterministic,
+    )
     device = torch.device(args.device)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -167,8 +227,16 @@ def main():
     )
 
 
-    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only).to(
-        device
+    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only)
+    if args.full_deterministic:
+        configure_full_deterministic_model(model)
+        print(
+            "Full deterministic mode: strict algorithms, Math SDP only, "
+            "TF32 disabled, DINOv2 position embeddings frozen",
+            flush=True,
+        )
+    model = model.to(
+        device,
     )
     # model.enable_gradient_checkpointing()
     optimizer = torch.optim.AdamW(
@@ -193,7 +261,10 @@ def main():
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_seed = (args.seed + (epoch - 1) * 1_000_003) % 2**32
-        seed_everything(epoch_seed)
+        seed_everything(
+            epoch_seed,
+            full_deterministic=args.full_deterministic,
+        )
         sampler_generator.manual_seed(epoch_seed)
         train_worker_generator.manual_seed(
             (epoch_seed + 1) % 2**32
@@ -236,7 +307,10 @@ def main():
                 )
                 equivariance = changed_scale + log_factor - output["log_scale"]
                 losses = model.compute_loss(output, batch, equivariance)
-
+                # loss_log.append(losses["total"].detach().cpu().numpy())
+                # if step == 100:
+                #     np.save(output_dir / "loss_log.npy", np.array(loss_log))
+                #     return
             scaler.scale(losses["total"] / args.accumulation).backward()
             if step % args.accumulation == 0 or step == len(train_loader):
                 scaler.unscale_(optimizer)
