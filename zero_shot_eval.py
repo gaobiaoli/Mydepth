@@ -41,7 +41,7 @@ def predict(model, sample, device, da3_predictor):
     rgb = cv2.resize(
         sample["rgb"],
         (process_shape[1], process_shape[0]),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=cv2.INTER_AREA,
     )
 
     rgb = torch.from_numpy(rgb.transpose(2, 0, 1).copy())[None].to(device)

@@ -269,7 +269,7 @@ class S23PriorBIMDataset(Dataset):
             semantic = cv2.resize(
                 semantic.astype(np.float32),
                 (self.width, self.height),
-                interpolation=cv2.INTER_NEAREST,
+                interpolation=cv2.INTER_NEAREST_EXACT,
             ).astype(np.int32)
 
         return np.ascontiguousarray(semantic)
