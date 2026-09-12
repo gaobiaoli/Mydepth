@@ -38,22 +38,38 @@ def predict(model, sample, device, da3_predictor):
     height, width = frame.image_shape
     process_shape = bim_depth.shape
     da3_depth = da3_predictor.predict_frame(frame)
+
+    # Match the original PriorBIMDA evaluator exactly: resize uint8 RGB first,
+    # then convert it to the [0, 1] float range expected by PriorBIMDA.  The
+    # toolkit's ``frame.rgb`` is float32 but deliberately retains [0, 255], so
+    # passing sample["rgb"] through unchanged would be saturated by the
+    # model's clamp(0, 1).
+    rgb = cv2.imread(str(frame.rgb_path), cv2.IMREAD_COLOR)
+    if rgb is None:
+        raise RuntimeError(f"Cannot read RGB image: {frame.rgb_path}")
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(
-        sample["rgb"],
+        rgb,
         (process_shape[1], process_shape[0]),
         interpolation=cv2.INTER_AREA,
     )
+    rgb = rgb.astype(np.float32) / 255.0
 
     rgb = torch.from_numpy(rgb.transpose(2, 0, 1).copy())[None].to(device)
     da3 = torch.from_numpy(da3_depth)[None, None].to(device)
     bim = torch.from_numpy(bim_depth)[None, None].to(device)
     bim_valid = bim > 0
 
+    amp_dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
     with (
         torch.inference_mode(),
         torch.autocast(
             device_type=device.type,
-            dtype=torch.float16,
+            dtype=amp_dtype,
             enabled=device.type == "cuda",
         ),
     ):

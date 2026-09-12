@@ -523,7 +523,7 @@ def main():
             device,
         )
     if args.full_deterministic:
-        configure_full_deterministic_model_matrix_interpolation(model)
+        configure_full_deterministic_model(model)
         print(
             "Full deterministic mode: strict algorithms and deterministic "
             "DINOv2 position interpolation; position embeddings trainable",

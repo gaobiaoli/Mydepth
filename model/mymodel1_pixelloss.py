@@ -9,6 +9,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from loss import priorbim_loss
+from loss.common import absrel_optimal_log_scale, depth_weights, masked_downsample, masked_frame_mean
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
@@ -256,7 +257,72 @@ class PriorBIMDA(nn.Module):
 
     def compute_loss(self, output, batch, equivariance_error=None):
         """计算本模型的训练损失，并保持 loss 实现集中在 loss 包中。"""
-        return priorbim_loss(output, batch, equivariance_error)
+        prediction = output["depth"].float()
+        target = batch["gt_depth"].float()
+        valid = (
+            (batch["gt_valid"] > 0)
+            & (target > 0)
+            & (prediction > 0)
+            & torch.isfinite(target)
+            & torch.isfinite(prediction)
+        )
+        weights = depth_weights(batch) * valid.float()
+        log_error = (prediction.clamp_min(1e-6).log() - target.clamp_min(1e-6).log()).abs()
+
+        pixel_loss = (log_error * weights).sum() / weights.sum().clamp_min(1)
+        frame_numerator = (log_error * weights).flatten(1).sum(1)
+        frame_denominator = weights.flatten(1).sum(1)
+        available = frame_denominator > 0
+        frame_loss = (frame_numerator[available] / frame_denominator[available]).mean()
+        depth_loss = 0.5 * (pixel_loss + frame_loss)
+
+        oracle_scale, supported = absrel_optimal_log_scale(
+            batch["da3_depth"].float(), target, batch["gt_valid"]
+        )
+        scale_error = F.smooth_l1_loss(
+            output["log_scale"].flatten(1).mean(1),
+            oracle_scale.flatten(1).mean(1),
+            reduction="none",
+            beta=0.02,
+        )
+        scale_loss = scale_error[supported].mean() if bool(supported.any()) else prediction.sum() * 0
+
+        oracle_depth = batch["da3_depth"].float() * oracle_scale.exp()
+        residual_target = target.clamp_min(1e-6).log() - oracle_depth.clamp_min(1e-6).log()
+        target_mean = (residual_target * valid).flatten(1).sum(1) / valid.flatten(1).sum(1).clamp_min(1)
+        residual_target = residual_target - target_mean[:, None, None, None]
+
+        native = output["log_residual_native"].float()
+        native_target, native_valid = masked_downsample(residual_target, valid, native.shape[-2:])
+        residual_loss = masked_frame_mean(
+            F.smooth_l1_loss(native, native_target, reduction="none", beta=0.02),
+            native_valid,
+        )
+        zero_mean_loss = native.mean(dim=(1, 2, 3)).abs().mean()
+        equivariance_loss = (
+            equivariance_error.float().square().mean()
+            if equivariance_error is not None
+            else prediction.sum() * 0
+        )
+
+        total = (
+            depth_loss
+            + 0.5 * scale_loss
+            + 0.5 * residual_loss
+            + 0.1 * zero_mean_loss
+            + 0.1 * equivariance_loss
+        )
+        return {
+            "total": total,
+            "depth": depth_loss,
+            "scale": scale_loss,
+            "residual": residual_loss,
+            "zero_mean": zero_mean_loss,
+            "equivariance": equivariance_loss,
+        }
+
+
+
 
     def parameter_groups(self,factor=1.0):
         """Learning rates from the best six-epoch training run."""
