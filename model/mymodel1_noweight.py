@@ -266,7 +266,7 @@ class PriorBIMDA(nn.Module):
             & torch.isfinite(target)
             & torch.isfinite(prediction)
         )
-        weights = depth_weights(batch) * valid.float()
+        weights = valid.float()
         log_error = (prediction.clamp_min(1e-6).log() - target.clamp_min(1e-6).log()).abs()
 
         pixel_loss = (log_error * weights).sum() / weights.sum().clamp_min(1)
@@ -274,7 +274,7 @@ class PriorBIMDA(nn.Module):
         frame_denominator = weights.flatten(1).sum(1)
         available = frame_denominator > 0
         frame_loss = (frame_numerator[available] / frame_denominator[available]).mean()
-        depth_loss = pixel_loss
+        depth_loss = 0.5 * (pixel_loss + frame_loss)
 
         oracle_scale, supported = absrel_optimal_log_scale(
             batch["da3_depth"].float(), target, batch["gt_valid"]

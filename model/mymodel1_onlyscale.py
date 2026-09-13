@@ -246,7 +246,7 @@ class PriorBIMDA(nn.Module):
         )
 
         scaled_depth = da3_depth.float() * log_scale.exp()
-        depth = (scaled_depth * log_residual.float().exp()).clamp(1e-3, 128)
+        depth = (scaled_depth).clamp(1e-3, 128)
         return {
             "depth": depth,
             "scaled_depth": scaled_depth,

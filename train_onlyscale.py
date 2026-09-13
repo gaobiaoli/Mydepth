@@ -17,7 +17,7 @@ from tqdm import tqdm
 # from MyDepth import loss
 from data import S23PriorBIMDataset
 from eval import evaluate, move_to
-from model.mymodel2 import PriorBIMDA
+from model.mymodel1_onlyscale import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
 
 
