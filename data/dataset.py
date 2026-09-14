@@ -8,8 +8,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 from s3dis_sam3d import decode_semantic_labels
+from torch.utils.data import DataLoader, Dataset
+
 from .transform import (
     Compose,
     RandomBIMEdgeDilation,
@@ -21,6 +22,7 @@ from .transform import (
     RandomHorizontalFlip,
     RandomRGBGainBias,
 )
+
 
 def to_semancit_path(rgb_path):
     semantic_path = (
@@ -70,7 +72,10 @@ transform = Compose(
 
 class S23PriorBIMDataset(Dataset):
     """
-    Stanford 2D-3D-S Area_1 + BIMSyn prepared dataset.
+    Stanford 2D-3D-S prepared dataset.
+
+    Area_1 is the primary dataset. Extra roots contribute train-only SyncBIM
+    samples, so validation and test always keep the original Area_1 protocol.
 
     Expected layout
     ---------------
@@ -119,10 +124,22 @@ class S23PriorBIMDataset(Dataset):
         split: str,
         *,
         augment: bool | None = None,
+        extra_dataset_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
+        extra_dataset_stride: int = 1,
     ):
         super().__init__()
 
         self.dataset_root = Path(dataset_root).expanduser().resolve()
+        self.extra_dataset_roots = tuple(
+            Path(path).expanduser().resolve()
+            for path in (extra_dataset_roots or ())
+        )
+        self.dataset_roots = (self.dataset_root, *self.extra_dataset_roots)
+        if len(self.dataset_roots) != len(set(self.dataset_roots)):
+            raise ValueError("Dataset roots must be unique")
+        self.extra_dataset_stride = int(extra_dataset_stride)
+        if self.extra_dataset_stride < 1:
+            raise ValueError("extra_dataset_stride must be positive")
 
         self.s23_root = Path(s23_root).expanduser().resolve()
 
@@ -156,19 +173,32 @@ class S23PriorBIMDataset(Dataset):
         # Manifest
         # ---------------------------------------------------------
 
-        manifest_path = self.dataset_root / "manifests" / f"{self.split}.jsonl"
-
-        if not manifest_path.is_file():
-            raise FileNotFoundError(manifest_path)
-
-        self.records = [
-            json.loads(line)
-            for line in manifest_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        roots = self.dataset_roots if self.split == "train" else (self.dataset_root,)
+        self.records = []
+        for root_index, root in enumerate(roots):
+            manifest_path = root / "manifests" / f"{self.split}.jsonl"
+            if not manifest_path.is_file():
+                raise FileNotFoundError(manifest_path)
+            lines = [
+                line
+                for line in manifest_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if root_index > 0:
+                lines = lines[:: self.extra_dataset_stride]
+            for line in lines:
+                record = json.loads(line)
+                if record.get("split") != self.split:
+                    raise ValueError(f"{record['id']}: manifest split mismatch")
+                record["_dataset_root"] = str(root)
+                record.setdefault(
+                    "training_source",
+                    "real_bim" if root_index == 0 else "syncbim",
+                )
+                self.records.append(record)
 
         if not self.records:
-            raise ValueError(f"Empty manifest: {manifest_path}")
+            raise ValueError(f"Empty {self.split} dataset in {roots}")
 
         # ---------------------------------------------------------
         # Basic consistency checks
@@ -179,9 +209,14 @@ class S23PriorBIMDataset(Dataset):
         if len(ids) != len(set(ids)):
             raise ValueError(f"Duplicate sample IDs in {manifest_path}")
 
-        for record in self.records:
-            if record.get("split") != self.split:
-                raise ValueError(f"{record['id']}: manifest split mismatch")
+        self.source_counts = {
+            source: sum(
+                record["training_source"] == source for record in self.records
+            )
+            for source in sorted(
+                {record["training_source"] for record in self.records}
+            )
+        }
 
     # =============================================================
     # Paths
@@ -194,7 +229,7 @@ class S23PriorBIMDataset(Dataset):
         path = Path(record["sample"])
 
         if not path.is_absolute():
-            path = self.dataset_root / path
+            path = Path(record["_dataset_root"]) / path
 
         return path
 
@@ -456,6 +491,10 @@ class S23PriorBIMDataset(Dataset):
             {
                 "sample_id": str(record["id"]),
                 "region": str(record["region"]),
+                "area": str(
+                    record.get("area", Path(record["rgb"]).parts[0])
+                ),
+                "training_source": str(record["training_source"]),
                 "camera_uuid": str(record["camera_uuid"]),
                 "frame_number": int(record["frame_number"]),
             }
@@ -478,19 +517,8 @@ def build_area1_dataloader(
     num_workers=8,
     shuffle=None,
     augment=None,
-    color_jitter=0.1,
-    horizontal_flip_probability=0.5,
-    bim_shift_probability=0.2,
-    bim_shift_pixels=4,
-    bim_dropout_probability=0.15,
-    bim_dropout_fraction=0.12,
-    bim_full_dropout_probability=0.03,
-    bim_depth_noise_probability=0.2,
-    bim_depth_noise_log_std=0.02,
-    bim_edge_dilation_probability=0.15,
-    bim_edge_dilation_pixels=3,
-    crop_height=504,
-    crop_width=504,
+    extra_dataset_roots=None,
+    extra_dataset_stride=1,
     pin_memory=True,
     persistent_workers=True,
     drop_last=None,
@@ -500,19 +528,8 @@ def build_area1_dataloader(
         s23_root=s23_root,
         split=split,
         augment=augment,
-        color_jitter=color_jitter,
-        horizontal_flip_probability=(horizontal_flip_probability),
-        bim_shift_probability=bim_shift_probability,
-        bim_shift_pixels=bim_shift_pixels,
-        bim_dropout_probability=bim_dropout_probability,
-        bim_dropout_fraction=bim_dropout_fraction,
-        bim_full_dropout_probability=bim_full_dropout_probability,
-        bim_depth_noise_probability=bim_depth_noise_probability,
-        bim_depth_noise_log_std=bim_depth_noise_log_std,
-        bim_edge_dilation_probability=bim_edge_dilation_probability,
-        bim_edge_dilation_pixels=bim_edge_dilation_pixels,
-        crop_height=crop_height,
-        crop_width=crop_width,
+        extra_dataset_roots=extra_dataset_roots,
+        extra_dataset_stride=extra_dataset_stride,
     )
 
     if shuffle is None:

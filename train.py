@@ -17,7 +17,7 @@ from tqdm import tqdm
 # from MyDepth import loss
 from data import S23PriorBIMDataset
 from eval import evaluate, move_to
-from model.mymodel2 import PriorBIMDA
+from model.mymodel import PriorBIMDA
 from zero_shot_eval import evaluate_zero_shot
 
 
@@ -390,10 +390,17 @@ def build_loaders(args, sampler_generator,train_worker_generator):
         args.dataset_root,
         args.s23_root,
         "train",
+        extra_dataset_roots=args.extra_dataset_root,
+        extra_dataset_stride=args.extra_dataset_stride,
     )
     val_set = S23PriorBIMDataset(args.dataset_root, args.s23_root, "val", augment=False)
     test_set = S23PriorBIMDataset(
         args.dataset_root, args.s23_root, "test", augment=False
+    )
+    print(
+        f"dataset: train={len(train_set)} {train_set.source_counts}, "
+        f"val={len(val_set)}, test={len(test_set)}",
+        flush=True,
     )
 
     # The best run sampled large rooms less often: weight(room) = count^-0.5.
@@ -473,6 +480,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset-root", default="/mnt/priorbimda-data/area1_priorbimda_504"
+    )
+    parser.add_argument(
+        "--extra-dataset-root",
+        action="append",
+        default=[],
+        help="train-only SyncBIM root; repeat this option to use multiple roots",
+    )
+    parser.add_argument(
+        "--extra-dataset-stride",
+        type=int,
+        default=1,
+        help="keep every Nth record from each extra training dataset",
     )
     parser.add_argument("--s23-root", default="/home/bgao491/Stanford2D3DS/no_xyz")
     parser.add_argument("--resume", action="store_true")
