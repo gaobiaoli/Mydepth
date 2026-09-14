@@ -12,9 +12,10 @@ from tqdm import tqdm
 
 from data import S23PriorBIMDataset
 from eval import evaluate, move_to
-from model.mymodel import PriorBIMDA
+from model.dense2dense import PriorBIMDA
 from train import (
     configure_full_deterministic_model,
+    load_checkpoint,
     save_checkpoint,
     seed_everything,
     seed_worker,
@@ -22,7 +23,7 @@ from train import (
 from zero_shot_eval import evaluate_zero_shot
 
 
-def build_loaders(args, sampler_generator, train_worker_generator):
+def build_loaders(args, sampler_generator, worker_generator):
     train_set = S23PriorBIMDataset(
         args.dataset_root,
         args.s23_root,
@@ -40,7 +41,6 @@ def build_loaders(args, sampler_generator, train_worker_generator):
         flush=True,
     )
 
-    # The best run sampled large rooms less often: weight(room) = count^-0.5.
     counts = Counter(record["region"] for record in train_set.records)
     weights = [counts[record["region"]] ** -0.5 for record in train_set.records]
     sampler = WeightedRandomSampler(
@@ -56,35 +56,18 @@ def build_loaders(args, sampler_generator, train_worker_generator):
     train_loader = DataLoader(
         train_set,
         sampler=sampler,
-        generator=train_worker_generator,
+        generator=worker_generator,
         drop_last=True,
         **common,
     )
-    val_loader = DataLoader(
-        val_set,
-        shuffle=False,
-        generator=torch.Generator().manual_seed(args.seed),
-        drop_last=False,
-        **common,
-    )
-    test_loader = DataLoader(
-        test_set,
-        shuffle=False,
-        generator=torch.Generator().manual_seed(args.seed),
-        drop_last=False,
-        **common,
-    )
+    val_loader = DataLoader(val_set, shuffle=False, drop_last=False, **common)
+    test_loader = DataLoader(test_set, shuffle=False, drop_last=False, **common)
     return train_loader, val_loader, test_loader
 
 
 def evaluate_test(model, loader, device, amp, checkpoint_path, output_dir):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])
-    best_epoch = checkpoint["epoch"]
-    history = checkpoint.get("history", [])
-    best_iter = history[-1].get("iter") if history else None
-    validation_abs_rel = checkpoint["best_validation_abs_rel"]
-    del checkpoint
     print(f"Evaluating test split with {checkpoint_path}", flush=True)
     metrics = evaluate(
         model,
@@ -94,30 +77,20 @@ def evaluate_test(model, loader, device, amp, checkpoint_path, output_dir):
     )
     result = {
         "checkpoint": str(checkpoint_path.resolve()),
-        "epoch": best_epoch,
-        "iter": best_iter,
-        "validation_abs_rel": validation_abs_rel,
+        "epoch": checkpoint["epoch"],
+        "validation_abs_rel": checkpoint["best_validation_abs_rel"],
         "metrics": metrics,
     }
     (output_dir / "test_metrics.json").write_text(
-        json.dumps(result, indent=2),
-        encoding="utf-8",
+        json.dumps(result, indent=2), encoding="utf-8"
     )
     print("test " + json.dumps(result), flush=True)
-    return result
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fine-tune PriorBIMDA on Area1 with optional extra training data."
+        description="Train the PriorDA-style dense-to-dense log-scale model."
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        required=True,
-        help="pretrained checkpoint; load model weights only",
-    )
-    parser.add_argument("--lr-factor", type=float, default=0.1)
     parser.add_argument(
         "--dataset-root", default="/mnt/priorbimda-data/area1_priorbimda_504"
     )
@@ -125,120 +98,63 @@ def main():
         "--extra-dataset-root",
         action="append",
         default=[],
-        help="train-only SyncBIM root; repeat this option to use multiple roots",
+        help="train-only SyncBIM root; repeat to use multiple roots",
     )
-    parser.add_argument(
-        "--extra-dataset-stride",
-        type=int,
-        default=1,
-        help="keep every Nth record from each extra training dataset",
-    )
+    parser.add_argument("--extra-dataset-stride", type=int, default=1)
     parser.add_argument("--s23-root", default="/home/bgao491/Stanford2D3DS/no_xyz")
-    parser.add_argument("--output", default="outputs/area1_stage2")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument(
-        "--iter",
-        type=int,
-        default=0,
-        help="optimizer updates; when positive, override --epochs (0: use epochs)",
-    )
+    parser.add_argument("--output", default="outputs/dense2dense_syncbim_stride1")
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--accumulation", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--full-deterministic",
-        action="store_true",
-        help=(
-            "enable strict deterministic algorithms and freeze DINOv2 "
-            "position embeddings"
-        ),
-    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--full-deterministic", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--zero-shot",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="run zero-shot evaluation after the Area1 test split",
     )
     args = parser.parse_args()
-    args.checkpoint = args.checkpoint.expanduser().resolve()
-    if not args.checkpoint.is_file():
-        parser.error(f"Checkpoint not found: {args.checkpoint}")
-    if not math.isfinite(args.lr_factor) or args.lr_factor <= 0:
-        parser.error("--lr-factor must be positive and finite")
-    if args.iter < 0:
-        parser.error("--iter must be nonnegative")
-    if args.iter == 0 and args.epochs < 1:
-        parser.error("--epochs must be positive")
-    if args.accumulation < 1:
-        parser.error("--accumulation must be positive")
-    output_dir = Path(args.output).expanduser().resolve()
-    if output_dir == args.checkpoint.parent:
-        parser.error("--output must differ from the pretrained checkpoint directory")
-    seed_everything(
-        args.seed,
-        full_deterministic=args.full_deterministic,
-    )
+
+    seed_everything(args.seed, full_deterministic=args.full_deterministic)
     device = torch.device(args.device)
+    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     sampler_generator = torch.Generator().manual_seed(args.seed)
-    train_worker_generator = torch.Generator().manual_seed(args.seed + 1)
-
+    worker_generator = torch.Generator().manual_seed(args.seed + 1)
     train_loader, val_loader, test_loader = build_loaders(
-        args,
-        sampler_generator,
-        train_worker_generator,
+        args, sampler_generator, worker_generator
     )
-    if len(train_loader) == 0:
-        parser.error("Training loader is empty; check the dataset and --batch-size")
 
-    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only)
-    model.load_checkpoint(args.checkpoint)
-    print(f"Loaded pretrained model weights from {args.checkpoint}", flush=True)
-    model = model.to(device)
+    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only).to(
+        device
+    )
     if args.full_deterministic:
         configure_full_deterministic_model(model)
-        print(
-            "Full deterministic mode: strict algorithms; "
-            "DINOv2 position embeddings frozen",
-            flush=True,
-        )
-
-    optimizer = torch.optim.AdamW(
-        model.parameter_groups(factor=args.lr_factor), weight_decay=0.01
-    )
+    optimizer = torch.optim.AdamW(model.parameter_groups(), weight_decay=0.01)
     steps_per_epoch = math.ceil(len(train_loader) / args.accumulation)
-    total_iters = args.iter or args.epochs * steps_per_epoch
-    duration = (
-        f"{args.iter} optimizer updates" if args.iter else f"{args.epochs} epochs"
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * steps_per_epoch
     )
-    print(
-        f"Fine-tuning for {duration} with lr_factor={args.lr_factor}; "
-        f"learning rates={[group['lr'] for group in optimizer.param_groups]}",
-        flush=True,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_iters)
     amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp, init_scale=1024)
     history = []
     best = float("inf")
-    optimizer_steps = 0
-    epoch = 0
-
-    while (args.iter > 0 and optimizer_steps < total_iters) or (
-        args.iter == 0 and epoch < args.epochs
-    ):
-        epoch += 1
-        epoch_seed = (args.seed + (epoch - 1) * 1_000_003) % 2**32
-        seed_everything(
-            epoch_seed,
-            full_deterministic=args.full_deterministic,
+    start_epoch = 1
+    if args.resume:
+        epoch, best, history = load_checkpoint(
+            output_dir / "latest.pt", model, optimizer, scheduler, scaler
         )
+        start_epoch = epoch + 1
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_seed = (args.seed + (epoch - 1) * 1_000_003) % 2**32
+        seed_everything(epoch_seed, full_deterministic=args.full_deterministic)
         sampler_generator.manual_seed(epoch_seed)
-        train_worker_generator.manual_seed((epoch_seed + 1) % 2**32)
+        worker_generator.manual_seed((epoch_seed + 1) % 2**32)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
@@ -246,9 +162,7 @@ def main():
 
         progress = tqdm(
             train_loader,
-            desc=f"train epoch {epoch}"
-            if args.iter
-            else f"train {epoch}/{args.epochs}",
+            desc=f"train {epoch}/{args.epochs}",
             unit="batch",
             dynamic_ncols=True,
         )
@@ -263,22 +177,7 @@ def main():
                     batch["bim_depth"],
                     batch["bim_valid"],
                 )
-
-                selected = (
-                    torch.rand((batch["rgb"].shape[0], 1, 1, 1), device=device) < 0.5
-                )
-                log_factor = torch.empty_like(output["log_scale"]).uniform_(-0.2, 0.2)
-                log_factor = torch.where(
-                    selected, log_factor, torch.zeros_like(log_factor)
-                )
-                changed_scale = model.predict_log_scale(
-                    batch["rgb"],
-                    batch["da3_depth"] * log_factor.exp(),
-                    batch["bim_depth"],
-                    batch["bim_valid"],
-                )
-                equivariance = changed_scale + log_factor - output["log_scale"]
-                losses = model.compute_loss(output, batch, equivariance)
+                losses = model.compute_loss(output, batch)
             scaler.scale(losses["total"] / args.accumulation).backward()
             if step % args.accumulation == 0 or step == len(train_loader):
                 scaler.unscale_(optimizer)
@@ -287,7 +186,6 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
                 if scaler.get_scale() >= previous_scale:
-                    optimizer_steps += 1
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -297,21 +195,13 @@ def main():
             progress.set_postfix(
                 loss=f"{running / samples:.5f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                iter=f"{optimizer_steps}/{total_iters}",
             )
-            if args.iter > 0 and optimizer_steps >= total_iters:
-                break
-        progress.close()
 
         metrics = evaluate(
             model,
             tqdm(
                 val_loader,
-                desc=(
-                    f"val @ iter {optimizer_steps}"
-                    if args.iter
-                    else f"val {epoch}/{args.epochs}"
-                ),
+                desc=f"val {epoch}/{args.epochs}",
                 unit="batch",
                 dynamic_ncols=True,
             ),
@@ -321,7 +211,6 @@ def main():
         score = metrics["final"]["abs_rel"]
         row = {
             "epoch": epoch,
-            "iter": optimizer_steps,
             "train_loss": running / samples,
             "val_abs_rel": score,
             "val_rmse": metrics["final"]["rmse"],
@@ -329,7 +218,6 @@ def main():
         }
         history.append(row)
         print(json.dumps(row), flush=True)
-
         save_checkpoint(
             output_dir / "latest.pt",
             model,
@@ -357,14 +245,11 @@ def main():
         )
 
     best_path = output_dir / "best.pt"
-    if not best_path.is_file():
-        raise FileNotFoundError(f"Best checkpoint not found: {best_path}")
     del optimizer, scheduler, scaler
     if device.type == "cuda":
         torch.cuda.empty_cache()
     evaluate_test(model, test_loader, device, amp, best_path, output_dir)
     if args.zero_shot:
-        print("Evaluating the default zero-shot scenes", flush=True)
         evaluate_zero_shot(
             model,
             device,
