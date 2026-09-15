@@ -150,3 +150,96 @@ def priorbim_loss(output, batch, equivariance_error=None):
         "zero_mean": zero_mean_loss,
         "equivariance": equivariance_loss,
     }
+
+
+def priorbim_multiscale_loss(output, batch, equivariance_error=None):
+    """Deep supervision after the F36, F72 and F144 corrections."""
+    target = batch["gt_depth"].float()
+    target_valid = (
+        (batch["gt_valid"] > 0)
+        & (target > 0)
+        & torch.isfinite(target)
+        & (batch["da3_depth"] > 0)
+        & torch.isfinite(batch["da3_depth"])
+    )
+    base_weights = depth_weights(batch)
+
+    def depth_loss(prediction):
+        valid = target_valid & (prediction > 0) & torch.isfinite(prediction)
+        weights = base_weights * valid.float()
+        log_error = (
+            prediction.clamp_min(1e-6).log() - target.clamp_min(1e-6).log()
+        ).abs()
+        pixel_loss = (log_error * weights).sum() / weights.sum().clamp_min(1)
+        frame_numerator = (log_error * weights).flatten(1).sum(1)
+        frame_denominator = weights.flatten(1).sum(1)
+        available = frame_denominator > 0
+        frame_loss = (
+            (frame_numerator[available] / frame_denominator[available]).mean()
+            if bool(available.any())
+            else prediction.sum() * 0
+        )
+        return 0.5 * (pixel_loss + frame_loss)
+
+    output_size = target.shape[-2:]
+    residual36 = F.interpolate(
+        output["log_residual_r36"].float(),
+        size=output_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    residual72 = F.interpolate(
+        output["log_residual_r72"].float(),
+        size=output_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    residual144 = F.interpolate(
+        output["log_residual_r144"].float(),
+        size=output_size,
+        mode="bilinear",
+        align_corners=False,
+    )
+    log_scale = output["log_scale"].float()
+    da3_depth = batch["da3_depth"].float()
+    depth36 = (da3_depth * (log_scale.detach() + residual36).exp()).clamp(1e-3, 128)
+    depth72 = (
+        da3_depth * (log_scale.detach() + residual36 + residual72).exp()
+    ).clamp(1e-3, 128)
+    depth144 = (
+        da3_depth * (log_scale.detach() + residual36.detach() + residual72.detach() + residual144).exp()
+    ).clamp(1e-3, 128)
+    loss36 = depth_loss(depth36)
+    loss72 = depth_loss(depth72)
+    loss144 = depth_loss(depth144)
+    combined_depth_loss = 0.2 * loss36 + 0.3 * loss72 + 0.5* loss144
+
+    oracle_scale, supported = absrel_optimal_log_scale(
+        batch["da3_depth"].float(), target, batch["gt_valid"]
+    )
+    scale_error = F.smooth_l1_loss(
+        output["log_scale"].flatten(1).mean(1),
+        oracle_scale.flatten(1).mean(1),
+        reduction="none",
+        beta=0.02,
+    )
+    scale_loss = (
+        scale_error[supported].mean()
+        if bool(supported.any())
+        else depth144.sum() * 0
+    )
+    equivariance_loss = (
+        equivariance_error.float().square().mean()
+        if equivariance_error is not None
+        else depth144.sum() * 0
+    )
+    total = combined_depth_loss + 0.5 * scale_loss + 0.1 * equivariance_loss
+    return {
+        "total": total,
+        "depth": combined_depth_loss,
+        "depth_r36": loss36,
+        "depth_r72": loss72,
+        "depth_r144": loss144,
+        "scale": scale_loss,
+        "equivariance": equivariance_loss,
+    }

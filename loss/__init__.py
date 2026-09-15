@@ -5,6 +5,7 @@ from .common import (
     masked_downsample,
     masked_frame_mean,
     priorbim_loss,
+    priorbim_multiscale_loss,
 )
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "masked_downsample",
     "masked_frame_mean",
     "priorbim_loss",
+    "priorbim_multiscale_loss",
 ]

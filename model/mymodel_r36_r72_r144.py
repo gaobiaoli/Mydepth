@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from loss import priorbim_loss
+from loss import priorbim_multiscale_loss
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
@@ -130,7 +130,7 @@ class ResidualStage(nn.Module):
         dtype = self.adapter.input_projection.weight.dtype
         delta = self.adapter(condition.to(dtype=dtype))
         logits = self.head(feature + delta.to(dtype=feature.dtype))
-        return 0.1 * torch.tanh(logits)
+        return 0.25 * torch.tanh(logits)
 
 
 class PriorBIMDA(nn.Module):
@@ -341,8 +341,7 @@ class PriorBIMDA(nn.Module):
         }
 
     def compute_loss(self, output, batch, equivariance_error=None):
-        """Use the same five losses as the original F36 model."""
-        return priorbim_loss(output, batch, equivariance_error)
+        return priorbim_multiscale_loss(output, batch, equivariance_error)
 
     def parameter_groups(self, factor=1.0):
         return [
