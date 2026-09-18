@@ -20,7 +20,8 @@ SPATIAL_KEYS = (
     "bim_edge",
     "gt_depth",
     "gt_valid",
-    "semantic_labels"
+    "semantic_labels",
+    "furniture_mask",
 )
 
 

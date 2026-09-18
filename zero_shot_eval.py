@@ -25,11 +25,37 @@ EXPECTED_SELECTION = {
     "1px": (793, "91e589da309b4c3eca24e88667e8c31ceab29fee9a151698d41977beea41e13d"),
 }
 DEFAULT_SCENES = tuple(EXPECTED_SELECTION)
-DEFAULT_DA3_CACHE = PROJECT_ROOT / "outputs/zero_shot_raw/da3_cache"
+ALL_SCENE = "all"
+DEFAULT_DA3_CACHE = "/mnt/priorbimda-data/zero_shot_raw/da3_cache"
 
 
 def frame_set_sha256(frame_ids):
     return hashlib.sha256("\n".join(sorted(frame_ids)).encode()).hexdigest()
+
+
+def resolve_scenes(dataset, scenes):
+    """Expand ``all`` to every usable Matterport3D/BIMNet scene pair."""
+    if isinstance(scenes, str):
+        scenes = [scenes]
+    else:
+        scenes = list(scenes)
+
+    select_all = [str(scene).casefold() == ALL_SCENE for scene in scenes]
+    if not any(select_all):
+        return scenes
+    if len(scenes) != 1:
+        raise ValueError(f"{ALL_SCENE!r} cannot be combined with explicit scenes")
+
+    mp3d_scene_ids = set(dataset.mp3d_dataset.scene_ids)
+    scenes = [
+        scene.key
+        for scene in dataset.bimnet_dataset.scenes
+        if scene.matterport_scan_id in mp3d_scene_ids
+        and scene.has_wall_filled_mesh
+    ]
+    if not scenes:
+        raise RuntimeError("No Matterport3D scenes with wall-filled BIM were found")
+    return scenes
 
 
 def predict(model, sample, device, da3_predictor):
@@ -111,8 +137,9 @@ def evaluate_scene(name, model, device, dataset, da3_predictor):
     print(f"{name}: {len(frames)} frames, selected={len(selected_ids)}", flush=True)
 
     selection_hash = frame_set_sha256(selected_ids)
-    if name in EXPECTED_SELECTION:
-        expected_count, expected_hash = EXPECTED_SELECTION[name]
+    benchmark_name = dataset.bimnet_dataset.scene(name).scene_id
+    if benchmark_name in EXPECTED_SELECTION:
+        expected_count, expected_hash = EXPECTED_SELECTION[benchmark_name]
         if (len(selected_ids), selection_hash) != (expected_count, expected_hash):
             raise RuntimeError(
                 f"{name} selection changed: got {len(selected_ids)} / {selection_hash}"
@@ -135,9 +162,10 @@ def evaluate_zero_shot(
     da3_cache=DEFAULT_DA3_CACHE,
     allow_network=False,
 ):
-    """Evaluate a loaded model on the frozen Matterport3D scenes."""
-    scenes = list(scenes)
+    """Evaluate a loaded model on selected Matterport3D/BIMNet scene pairs."""
     dataset = MP3D_BIMDataset(default_mesh_source="obj_wall_filled")
+    scenes = resolve_scenes(dataset, scenes)
+    print(f"Evaluating {len(scenes)} zero-shot scene(s): {', '.join(scenes)}", flush=True)
     da3_predictor = DA3Predictor(
         device=device,
         cache_root=da3_cache,
@@ -191,19 +219,24 @@ def main():
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=PROJECT_ROOT / "outputs/adapter_3resblocks_raw/best.pt",
+        default=PROJECT_ROOT / "outputs/area1_syncbim_stride1/best.pt",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=PROJECT_ROOT / "outputs/zero_shot_raw/best.json",
+        default=PROJECT_ROOT / "outputs/area1_syncbim_stride1/best1.json",
     )
     parser.add_argument(
         "--da3-cache",
         type=Path,
         default=DEFAULT_DA3_CACHE,
     )
-    parser.add_argument("--scenes", nargs="+", default=list(DEFAULT_SCENES))
+    parser.add_argument(
+        "--scenes",
+        nargs="+",
+        default=list(DEFAULT_SCENES),
+        help=f"BIMNet scene IDs, or {ALL_SCENE!r} for every usable MP3D/BIMNet pair",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--allow-network", action="store_true")
     args = parser.parse_args()

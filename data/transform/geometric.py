@@ -275,6 +275,7 @@ class Resize(Transform):
         for key in (
             "bim_valid",
             "gt_valid",
+            "furniture_mask",
         ):
             if key in sample:
                 mask = _resize_chw(

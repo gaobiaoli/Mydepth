@@ -11,6 +11,7 @@ import torch
 from s3dis_sam3d import decode_semantic_labels
 from torch.utils.data import DataLoader, Dataset
 
+from .scannet_adapter import ScanNetDatasetAdapter
 from .transform import (
     Compose,
     RandomBIMEdgeDilation,
@@ -164,6 +165,7 @@ class S23PriorBIMDataset(Dataset):
 
         target_shape = (504, 504)
         self.height, self.width = target_shape
+        self.scannet_adapter = ScanNetDatasetAdapter(target_shape)
 
         # Keep the same transform order and parameter values as the original
         # PriorBIMDA F36/Adapter training dataset.
@@ -463,13 +465,22 @@ class S23PriorBIMDataset(Dataset):
         sample_path = self._sample_path(record)
 
         rgb_path = self._rgb_path(record)
-        semantic_path = to_semancit_path(rgb_path)
-        semantic_labels = self._load_semantic(semantic_path)
+        if record.get("dataset") == "scannet":
+            semantics = self.scannet_adapter.load_semantics(rgb_path)
+            camera_uuid = self.scannet_adapter.camera_uuid(record)
+        else:
+            semantic_path = to_semancit_path(rgb_path)
+            semantic_labels = self._load_semantic(semantic_path)
+            semantics = {
+                "semantic_labels": semantic_labels,
+                "furniture_mask": np.isin(semantic_labels, [7, 8, 9, 10]).astype(np.float32)[None],
+            }
+            camera_uuid = str(record["camera_uuid"])
 
         arrays = self._load_sample(sample_path)
 
         arrays["rgb"] = self._load_rgb(rgb_path)
-        arrays["semantic_labels"] = semantic_labels
+        arrays.update(semantics)
 
         if self.augment:
             arrays = self._augment(arrays)
@@ -495,7 +506,7 @@ class S23PriorBIMDataset(Dataset):
                     record.get("area", Path(record["rgb"]).parts[0])
                 ),
                 "training_source": str(record["training_source"]),
-                "camera_uuid": str(record["camera_uuid"]),
+                "camera_uuid": camera_uuid,
                 "frame_number": int(record["frame_number"]),
             }
         )
