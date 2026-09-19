@@ -34,28 +34,57 @@ def frame_set_sha256(frame_ids):
 
 
 def resolve_scenes(dataset, scenes):
-    """Expand ``all`` to every usable Matterport3D/BIMNet scene pair."""
+    """Validate explicit scene IDs or expand ``all`` to every usable pair."""
     if isinstance(scenes, str):
         scenes = [scenes]
-    else:
-        scenes = list(scenes)
-
-    select_all = [str(scene).casefold() == ALL_SCENE for scene in scenes]
-    if not any(select_all):
-        return scenes
-    if len(scenes) != 1:
-        raise ValueError(f"{ALL_SCENE!r} cannot be combined with explicit scenes")
-
-    mp3d_scene_ids = set(dataset.mp3d_dataset.scene_ids)
     scenes = [
-        scene.key
-        for scene in dataset.bimnet_dataset.scenes
-        if scene.matterport_scan_id in mp3d_scene_ids
-        and scene.has_wall_filled_mesh
+        item.strip()
+        for value in scenes
+        for item in str(value).split(",")
+        if item.strip()
     ]
     if not scenes:
-        raise RuntimeError("No Matterport3D scenes with wall-filled BIM were found")
-    return scenes
+        raise ValueError("At least one scene ID is required")
+
+    select_all = [str(scene).casefold() == ALL_SCENE for scene in scenes]
+    mp3d_scene_ids = set(dataset.mp3d_dataset.scene_ids)
+
+    def validate(scene):
+        if scene.matterport_scan_id not in mp3d_scene_ids:
+            raise ValueError(
+                f"Matterport3D scan is unavailable for BIMNet scene {scene.key!r}"
+            )
+
+    if any(select_all):
+        if len(scenes) != 1:
+            raise ValueError(f"{ALL_SCENE!r} cannot be combined with explicit scenes")
+        resolved = [
+            scene.key
+            for scene in dataset.bimnet_dataset.scenes
+            if scene.matterport_scan_id in mp3d_scene_ids
+        ]
+        if not resolved:
+            raise RuntimeError("No paired Matterport3D/BIMNet scenes were found")
+        return resolved
+
+    resolved = []
+    seen = set()
+    for identifier in scenes:
+        floor_scenes = dataset.bimnet_dataset.scenes_for_scan(identifier)
+        if not floor_scenes:
+            floor_scenes = (dataset.bimnet_dataset.scene(identifier),)
+
+        # A Matterport scan may contain several BIMNet floor scenes. Evaluate
+        # each floor separately because MP3D_BIMDataset applies its containment
+        # rule to one floor envelope at a time.
+        multiple_floors = len(floor_scenes) > 1
+        for scene in floor_scenes:
+            validate(scene)
+            if scene.key in seen:
+                continue
+            resolved.append(scene.key if multiple_floors else identifier)
+            seen.add(scene.key)
+    return resolved
 
 
 def predict(model, sample, device, da3_predictor):
@@ -161,9 +190,10 @@ def evaluate_zero_shot(
     scenes=DEFAULT_SCENES,
     da3_cache=DEFAULT_DA3_CACHE,
     allow_network=False,
+    mesh_source="obj",
 ):
     """Evaluate a loaded model on selected Matterport3D/BIMNet scene pairs."""
-    dataset = MP3D_BIMDataset(default_mesh_source="obj_wall_filled")
+    dataset = MP3D_BIMDataset(default_mesh_source=mesh_source)
     scenes = resolve_scenes(dataset, scenes)
     print(f"Evaluating {len(scenes)} zero-shot scene(s): {', '.join(scenes)}", flush=True)
     da3_predictor = DA3Predictor(
@@ -194,7 +224,7 @@ def evaluate_zero_shot(
         "protocol": {
             "scenes": scenes,
             "process_resolution": DA3_PROCESS_RES,
-            "mesh": "registered wall-filled BIMNet OBJ",
+            "mesh": f"registered BIMNet {mesh_source}",
             "selection": "GT>10%, BIM hits>20%, camera inside BIM AABB",
             "aggregation": "pixel-micro and frame-macro over selected frames",
             "gt_usage": "scoring and frame selection only",
@@ -211,8 +241,6 @@ def evaluate_zero_shot(
 
 
 def main():
-    from model.mymodel import PriorBIMDA
-
     parser = argparse.ArgumentParser(
         description="Zero-shot Matterport3D/BIMNet evaluation"
     )
@@ -234,16 +262,42 @@ def main():
     parser.add_argument(
         "--scenes",
         nargs="+",
-        default=list(DEFAULT_SCENES),
-        help=f"BIMNet scene IDs, or {ALL_SCENE!r} for every usable MP3D/BIMNet pair",
+        metavar="SCENE",
+        # default=list(DEFAULT_SCENES),
+        default=["s9h"],
+        help=(
+            "one or more BIMNet/MP3D scene IDs (space- or comma-separated), "
+            f"or {ALL_SCENE!r} for every usable pair"
+        ),
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--allow-network", action="store_true")
+    parser.add_argument(
+        "--mesh-source",
+        choices=("obj", "wall-filled"),
+        default="obj",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
+
+    checkpoint = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=False,
+        mmap=True,
+    )
+    state = checkpoint.get("model", checkpoint)
+    multiscale = any(name.startswith("stage72.") for name in state)
+    del state, checkpoint
+    if multiscale:
+        from model.mymodel_r36_r72_r144 import PriorBIMDA
+
+        print("Detected adapter R36/R72/R144 checkpoint", flush=True)
+    else:
+        from model.mymodel import PriorBIMDA
 
     model = PriorBIMDA.from_pretrained(local_files_only=not args.allow_network)
     model.load_checkpoint(args.checkpoint)
@@ -257,6 +311,9 @@ def main():
         scenes=args.scenes,
         da3_cache=args.da3_cache,
         allow_network=args.allow_network,
+        mesh_source=(
+            "obj_wall_filled" if args.mesh_source == "wall-filled" else "obj"
+        ),
     )
 
 
