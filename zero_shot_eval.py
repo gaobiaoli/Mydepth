@@ -263,8 +263,8 @@ def main():
         "--scenes",
         nargs="+",
         metavar="SCENE",
-        # default=list(DEFAULT_SCENES),
-        default=["s9h"],
+        default=list(DEFAULT_SCENES),
+        # default=["s9h"],
         help=(
             "one or more BIMNet/MP3D scene IDs (space- or comma-separated), "
             f"or {ALL_SCENE!r} for every usable pair"
