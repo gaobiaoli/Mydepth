@@ -476,7 +476,7 @@ def evaluate_test(model, loader, device, amp, checkpoint_path, output_dir):
     return result
 
 
-def main():
+def main(model_class=PriorBIMDA):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset-root", default="/mnt/priorbimda-data/area1_priorbimda_504"
@@ -537,7 +537,7 @@ def main():
     )
 
 
-    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only)
+    model = model_class.from_pretrained(local_files_only=args.local_files_only)
     model = model.to(
             device,
         )
