@@ -40,6 +40,25 @@ python -m pip install -e "../S3-SAM3D-ToolKit[exr,ifc]"
 python -m pip install -e ../Depth-Anything-3
 ```
 
+### UniDepthV2 推理依赖
+
+在本机 `priorbimda` 环境中，ViT-L 推理所缺的包可单独安装，保留该环境已有的
+PyTorch 2.6.0+cu124、xFormers 和 NumPy 1.26.4：
+
+```bash
+conda activate priorbimda
+python -m pip install timm==1.0.19 'wandb>=0.19,<0.20'
+python -m pip install --no-deps \
+    'git+https://github.com/lpiccinelli-eth/UniDepth.git@8d8cfe4c7ee15297099983607febf0d4f32eb3d6'
+python -c 'from unidepth.models import UniDepthV2; print(UniDepthV2.__name__)'
+```
+
+这里安装的是评测脚本所需的推理路径。UniDepth 官方包还声明了 Gradio、HDF5、
+Torchaudio 等训练/演示依赖及 NumPy 2.x；因此这个保留现有版本的环境执行
+`pip check` 时会报告这些未安装依赖和 NumPy 版本差异。KNN 扩展仅用于 UniDepth
+自带的 3D 评测，当前 `zero_shot_eval.py` 的深度指标不调用它。ViT-L 权重尚未缓存时，
+首次运行 `zero_shot_eval.py` 需加 `--allow-network` 下载权重。
+
 PyTorch 安装命令参考 [官方历史版本说明](https://pytorch.org/get-started/previous-versions/)。DA3 安装会带入其自身依赖；本项目不需要 Gradio 或 3D Gaussian rendering，因此无需安装 DA3 的 `app` / `gs` 扩展。上面是参考安装流程，本次核对的是已有环境，未重新建立全新环境验证。
 
 如果已有环境只使用本地源码而未完成 editable 安装，可设置：
