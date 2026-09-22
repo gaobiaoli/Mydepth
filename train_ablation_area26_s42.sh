@@ -16,10 +16,13 @@ s23_root="/home/bgao491/Stanford2D3DS/no_xyz"
 # train_noweight_pixelloss.py runs Area1 test and the default three-scene
 # zero-shot evaluation with best.pt. The full-scene OBJ evaluation below uses
 # the final epoch, matching the Area2-6 seed-42 baseline protocol.
-output_dir="outputs/ablation_area26_s42_noweight_pixelloss"
 
-echo "[$(date '+%F %T')] Training noweight_pixelloss: ${output_dir}"
-"${python_bin}" -u train_noweight_pixelloss.py \
+# Keep the perturbed-depth forward and random-number consumption identical to
+# noweight; only the equivariance loss contribution is disabled in the model.
+output_dir="outputs/ablation_area26_s42_noequalloss_noweight"
+
+echo "[$(date '+%F %T')] Training noequalloss_noweight: ${output_dir}"
+"${python_bin}" -u train_noweight_noequalloss.py \
     --dataset-root "${area1_root}" \
     --s23-root "${s23_root}" \
     --extra-dataset-root "${area2_5_root}" \
@@ -35,37 +38,7 @@ echo "[$(date '+%F %T')] Training noweight_pixelloss: ${output_dir}"
     --zero-shot \
     --output "${output_dir}"
 
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noweight_pixelloss"
-"${python_bin}" -u zero_shot_eval.py \
-    --checkpoint "${output_dir}/latest.pt" \
-    --output "${output_dir}/zero_shot_all_metrics_latest_obj.json" \
-    --scenes all \
-    --mesh-source obj
-
-echo "[$(date '+%F %T')] noweight_pixelloss ablation completed"
-
-# This run differs from the completed noweight experiment only by disabling
-# the equivariance loss and its perturbed-depth scale prediction.
-output_dir="outputs/ablation_area26_s42_noequal_noweight"
-
-echo "[$(date '+%F %T')] Training noequal_noweight: ${output_dir}"
-"${python_bin}" -u train_noequal_noweight.py \
-    --dataset-root "${area1_root}" \
-    --s23-root "${s23_root}" \
-    --extra-dataset-root "${area2_5_root}" \
-    --extra-dataset-root "${area6_root}" \
-    --extra-dataset-stride 1 \
-    --seed 42 \
-    --full-deterministic \
-    --epochs 6 \
-    --batch-size 4 \
-    --accumulation 4 \
-    --num-workers 8 \
-    --device cuda \
-    --zero-shot \
-    --output "${output_dir}"
-
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequal_noweight"
+echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequalloss_noweight"
 "${python_bin}" -u zero_shot_eval.py \
     --checkpoint "${output_dir}/latest.pt" \
     --output "${output_dir}/zero_shot_all_metrics_latest_obj.json" \

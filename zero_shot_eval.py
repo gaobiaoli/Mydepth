@@ -197,7 +197,7 @@ def evaluate_zero_shot(
     dataset = MP3D_BIMDataset(default_mesh_source=mesh_source)
     scenes = resolve_scenes(dataset, scenes)
     print(f"Evaluating {len(scenes)} zero-shot scene(s): {', '.join(scenes)}", flush=True)
-    da3_predictor = UniDepthV2Predictor(
+    da3_predictor = DA3Predictor(
         device=device,
         cache_root=da3_cache,
         local_files_only=not allow_network,

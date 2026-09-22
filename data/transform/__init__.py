@@ -24,6 +24,7 @@ from .prior import (
     RandomBIMShift,
     RandomBIMSquareDropout,
 )
+from .prediction import RandomPredictionScale
 
 __all__ = [
     "Compose",
@@ -41,6 +42,7 @@ __all__ = [
     "RandomHorizontalFlip",
     "RandomRGBGainBias",
     "RandomRGBGaussianNoise",
+    "RandomPredictionScale",
     "Resize",
     "Sample",
     "Transform",
