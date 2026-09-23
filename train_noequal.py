@@ -3,15 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
 
-from data.transform import Compose, RandomPredictionScale
 from eval import evaluate, move_to
-from model.mymodel1_noweight import PriorBIMDA
+from model.mymodel import PriorBIMDA
 from train import (
     build_loaders,
     configure_full_deterministic_model,
@@ -23,16 +21,7 @@ from train import (
 from zero_shot_eval import evaluate_zero_shot
 
 
-class IndependentPredictionScale(RandomPredictionScale):
-    """Add DA3 scale noise without advancing the other augmentations' RNG."""
-
-    def __call__(self, sample, *, rng):
-        local_rng = random.Random()
-        local_rng.setstate(rng.getstate())
-        return super().__call__(sample, rng=local_rng)
-
-
-def main():
+def main(model_class=PriorBIMDA):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--dataset-root", default="/mnt/priorbimda-data/area1_priorbimda_504"
@@ -91,20 +80,7 @@ def main():
         train_worker_generator,
     )
 
-    train_loader.dataset.transform = Compose(
-        [
-            *train_loader.dataset.transform.transforms,
-            IndependentPredictionScale(max_log_scale=0.2, p=1.0),
-        ]
-    )
-    print(
-        "Raw-pred scale augmentation enabled: "
-        "D_pred *= exp(U[-0.2, 0.2]), p=1.0; "
-        "base augmentation RNG preserved",
-        flush=True,
-    )
-
-    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only)
+    model = model_class.from_pretrained(local_files_only=args.local_files_only)
     model = model.to(device)
     if args.full_deterministic:
         configure_full_deterministic_model(model)
@@ -253,6 +229,7 @@ def main():
             output_dir / "zero_shot_metrics.json",
             allow_network=not args.local_files_only,
         )
+
 
 if __name__ == "__main__":
     main()

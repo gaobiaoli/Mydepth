@@ -15,10 +15,9 @@ s23_root="/home/bgao491/Stanford2D3DS/no_xyz"
 
 # The trainer evaluates Area1 test and the default three zero-shot scenes with
 # best.pt. The full-scene OBJ evaluation below uses the final-epoch latest.pt.
-output_dir="outputs/ablation_area26_s42_noequal_noweight_aug"
-
-echo "[$(date '+%F %T')] Training noequal_noweight_aug: ${output_dir}"
-"${python_bin}" -u train_noequal_noweight_aug.py \
+output_dir="outputs/ablation_area26_s42_noequal_noweight1111"
+echo "[$(date '+%F %T')] Training noequal_noweight_nomean: ${output_dir}"
+"${python_bin}" -u train_noequal_noweight.py \
     --dataset-root "${area1_root}" \
     --s23-root "${s23_root}" \
     --extra-dataset-root "${area2_5_root}" \
@@ -34,21 +33,3 @@ echo "[$(date '+%F %T')] Training noequal_noweight_aug: ${output_dir}"
     --zero-shot \
     --output "${output_dir}"
 
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequal_noweight_aug"
-"${python_bin}" -u zero_shot_eval.py \
-    --checkpoint "${output_dir}/latest.pt" \
-    --output "${output_dir}/zero_shot_all_metrics_latest_obj.json" \
-    --scenes all \
-    --mesh-source obj
-
-echo "[$(date '+%F %T')] noequal_noweight_aug completed"
-
-
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequal_noweight_aug"
-"${python_bin}" -u zero_shot_eval.py \
-    --checkpoint "${output_dir}/best.pt" \
-    --output "${output_dir}/zero_shot_all_metrics_best_obj.json" \
-    --scenes all \
-    --mesh-source obj
-
-echo "[$(date '+%F %T')] noequal_noweight_aug completed"

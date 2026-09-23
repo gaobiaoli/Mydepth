@@ -1,4 +1,4 @@
-from model.mymodel1_noweight import PriorBIMDA
+from model.mymodel1_noweight_nomean import PriorBIMDA
 from train_noequal import main
 
 

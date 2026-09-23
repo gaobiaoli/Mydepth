@@ -13,10 +13,12 @@ from s3dis_sam3d.mde import (
     DA3_PROCESS_RES,
     DA3Predictor,
     UniDepthV2Predictor,
+    MoGe2Predictor,
+    MoGe3Predictor,
     DepthMetricAccumulator,
     da3_processed_geometry,
 )
-
+DA3Predictor = MoGe3Predictor
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Frozen three-rule benchmark used by the previous PriorBIMDA experiments.
