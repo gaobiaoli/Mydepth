@@ -13,42 +13,54 @@ area2_5_root="/mnt/priorbimda-data/s23_syncbim_area2_5_504"
 area6_root="/mnt/priorbimda-data/s23_syncbim_area6_504"
 s23_root="/home/bgao491/Stanford2D3DS/no_xyz"
 
-# The trainer evaluates Area1 test and the default three zero-shot scenes with
-# best.pt. The full-scene OBJ evaluation below uses the final-epoch latest.pt.
-output_dir="outputs/ablation_area26_s42_noequal_noweight_aug"
+sleep 6h
+# Each trainer evaluates Area1 test and the default three zero-shot scenes
+# with best.pt. Full-scene OBJ evaluation is run for both latest.pt and best.pt.
+run_experiment() {
+    local name="$1"
+    local trainer="$2"
+    local output_dir="$3"
 
-echo "[$(date '+%F %T')] Training noequal_noweight_aug: ${output_dir}"
-"${python_bin}" -u train_noequal_noweight_aug.py \
-    --dataset-root "${area1_root}" \
-    --s23-root "${s23_root}" \
-    --extra-dataset-root "${area2_5_root}" \
-    --extra-dataset-root "${area6_root}" \
-    --extra-dataset-stride 1 \
-    --seed 42 \
-    --full-deterministic \
-    --epochs 6 \
-    --batch-size 4 \
-    --accumulation 4 \
-    --num-workers 8 \
-    --device cuda \
-    --zero-shot \
-    --output "${output_dir}"
+    echo "[$(date '+%F %T')] Training ${name}: ${output_dir}"
+    "${python_bin}" -u "${trainer}" \
+        --dataset-root "${area1_root}" \
+        --s23-root "${s23_root}" \
+        --extra-dataset-root "${area2_5_root}" \
+        --extra-dataset-root "${area6_root}" \
+        --extra-dataset-stride 1 \
+        --seed 42 \
+        --full-deterministic \
+        --epochs 6 \
+        --batch-size 4 \
+        --accumulation 4 \
+        --num-workers 8 \
+        --device cuda \
+        --zero-shot \
+        --output "${output_dir}"
 
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequal_noweight_aug"
-"${python_bin}" -u zero_shot_eval.py \
-    --checkpoint "${output_dir}/latest.pt" \
-    --output "${output_dir}/zero_shot_all_metrics_latest_obj.json" \
-    --scenes all \
-    --mesh-source obj
+    echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes with latest.pt: ${name}"
+    "${python_bin}" -u zero_shot_eval.py \
+        --checkpoint "${output_dir}/latest.pt" \
+        --output "${output_dir}/zero_shot_all_metrics_latest_obj.json" \
+        --scenes all \
+        --mesh-source obj
 
-echo "[$(date '+%F %T')] noequal_noweight_aug completed"
+    echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes with best.pt: ${name}"
+    "${python_bin}" -u zero_shot_eval.py \
+        --checkpoint "${output_dir}/best.pt" \
+        --output "${output_dir}/zero_shot_all_metrics_best_obj.json" \
+        --scenes all \
+        --mesh-source obj
 
+    echo "[$(date '+%F %T')] ${name} completed"
+}
 
-echo "[$(date '+%F %T')] Evaluating 25 OBJ scenes: noequal_noweight_aug"
-"${python_bin}" -u zero_shot_eval.py \
-    --checkpoint "${output_dir}/best.pt" \
-    --output "${output_dir}/zero_shot_all_metrics_best_obj.json" \
-    --scenes all \
-    --mesh-source obj
+run_experiment \
+    noequal_noweight_03tanh \
+    train_noequal_noweight_03tanh.py \
+    outputs/ablation_area26_s42_noequal_noweight_03tanh
 
-echo "[$(date '+%F %T')] noequal_noweight_aug completed"
+run_experiment \
+    noequal_noweight_notanh \
+    train_noequal_noweight_notanh.py \
+    outputs/ablation_area26_s42_noequal_noweight_notanh

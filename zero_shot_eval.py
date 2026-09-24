@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from torch.nn import functional as F
 from s3dis_sam3d import MP3D_BIMDataset
 from s3dis_sam3d.mde import (
     DA3_PROCESS_RES,
@@ -18,7 +19,7 @@ from s3dis_sam3d.mde import (
     DepthMetricAccumulator,
     da3_processed_geometry,
 )
-DA3Predictor = MoGe3Predictor
+# DA3Predictor = MoGe3Predictor
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Frozen three-rule benchmark used by the previous PriorBIMDA experiments.
@@ -90,6 +91,37 @@ def resolve_scenes(dataset, scenes):
     return resolved
 
 
+def prediction_depths(output, da3_depth):
+    """Return the legacy predictions plus every cumulative residual stage."""
+    scaled_depth = output["scaled_depth"].float()
+    predictions = {
+        "da3": da3_depth.float(),
+        "global_scale": scaled_depth,
+    }
+
+    stages = []
+    prefix = "log_residual_r"
+    for name, residual in output.items():
+        if name.startswith(prefix) and name[len(prefix) :].isdigit():
+            stages.append((int(name[len(prefix) :]), residual))
+
+    cumulative = torch.zeros_like(scaled_depth)
+    for resolution, residual in sorted(stages):
+        residual = F.interpolate(
+            residual.float(),
+            size=scaled_depth.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        cumulative = cumulative + residual
+        predictions[f"r{resolution}"] = (
+            scaled_depth * cumulative.exp()
+        ).clamp(1e-3, 128)
+
+    predictions["final"] = output["depth"].float()
+    return predictions
+
+
 def predict(model, sample, device, da3_predictor):
     frame = sample["frame"]
     bim_depth = sample["bim_depth"]
@@ -134,10 +166,10 @@ def predict(model, sample, device, da3_predictor):
         output = model(rgb, da3, bim, bim_valid)
 
     predictions = {
-        "da3": da3_depth,
-        "global_scale": output["scaled_depth"].float().squeeze().cpu().numpy(),
-        "final": output["depth"].float().squeeze().cpu().numpy(),
+        name: value.squeeze().cpu().numpy()
+        for name, value in prediction_depths(output, da3).items()
     }
+    predictions["da3"] = da3_depth
     return {
         name: cv2.resize(value, (width, height), interpolation=cv2.INTER_LINEAR)
         for name, value in predictions.items()
@@ -155,7 +187,7 @@ def evaluate_scene(name, model, device, dataset, da3_predictor):
             f"{name} contains inconsistent DA3 input shapes: {process_shapes}"
         )
     process_shape = process_shapes.pop()
-    totals = {key: DepthMetricAccumulator() for key in ("da3", "global_scale", "final")}
+    totals = {}
     selected_ids = []
 
     for sample in dataset.iter_scene(name, size=process_shape, progress=True):
@@ -163,6 +195,16 @@ def evaluate_scene(name, model, device, dataset, da3_predictor):
         gt_valid = np.isfinite(gt_depth) & (gt_depth > 0)
         selected_ids.append(sample["frame_id"])
         predictions = predict(model, sample, device, da3_predictor)
+        if not totals:
+            totals = {
+                key: DepthMetricAccumulator()
+                for key in predictions
+            }
+        elif predictions.keys() != totals.keys():
+            raise RuntimeError(
+                f"{name} returned inconsistent prediction stages: "
+                f"{list(predictions)} != {list(totals)}"
+            )
         for key, prediction in predictions.items():
             totals[key].update(prediction, gt_depth, gt_valid)
 
@@ -204,9 +246,7 @@ def evaluate_zero_shot(
         cache_root=da3_cache,
         local_files_only=not allow_network,
     )
-    overall = {
-        key: DepthMetricAccumulator() for key in ("da3", "global_scale", "final")
-    }
+    overall = {}
     scene_results = {}
 
     model.eval()
@@ -219,19 +259,32 @@ def evaluate_zero_shot(
             da3_predictor,
         )
         scene_results[name] = result
-        for key, overall_values in overall.items():
-            overall_values.merge(totals[key])
+        if overall and totals.keys() != overall.keys():
+            raise RuntimeError(
+                f"{name} returned different prediction stages: "
+                f"{list(totals)} != {list(overall)}"
+            )
+        for key, values in totals.items():
+            overall.setdefault(key, DepthMetricAccumulator()).merge(values)
+
+    protocol = {
+        "scenes": scenes,
+        "process_resolution": DA3_PROCESS_RES,
+        "mesh": f"registered BIMNet {mesh_source}",
+        "selection": "GT>10%, BIM hits>20%, camera inside BIM AABB",
+        "aggregation": "pixel-micro and frame-macro over selected frames",
+        "gt_usage": "scoring and frame selection only",
+    }
+    residual_stages = [
+        name for name in overall if name.startswith("r") and name[1:].isdigit()
+    ]
+    if residual_stages:
+        protocol["predictions"] = list(overall)
+        protocol["final_alias"] = residual_stages[-1]
 
     summary = {
         "checkpoint": str(Path(checkpoint).resolve()),
-        "protocol": {
-            "scenes": scenes,
-            "process_resolution": DA3_PROCESS_RES,
-            "mesh": f"registered BIMNet {mesh_source}",
-            "selection": "GT>10%, BIM hits>20%, camera inside BIM AABB",
-            "aggregation": "pixel-micro and frame-macro over selected frames",
-            "gt_usage": "scoring and frame selection only",
-        },
+        "protocol": protocol,
         "scenes": scene_results,
         "overall": {key: value.compute() for key, value in overall.items()},
     }
