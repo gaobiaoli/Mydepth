@@ -30,7 +30,7 @@ EXPECTED_SELECTION = {
 }
 DEFAULT_SCENES = tuple(EXPECTED_SELECTION)
 ALL_SCENE = "all"
-DEFAULT_DA3_CACHE = "/mnt/priorbimda-data/zero_shot_raw/da3_cache"
+DEFAULT_DA3_CACHE = "/root/Mydepth/outputs/zero_shot_raw/da3_cache"
 
 
 def frame_set_sha256(frame_ids):
@@ -348,6 +348,7 @@ def main():
     state = checkpoint.get("model", checkpoint)
     multiscale = any(name.startswith("stage72.") for name in state)
     dense2dense = any(name.startswith("dense_head.") for name in state)
+    scale_shift = any(name.startswith("calibration_head.") for name in state)
     del state, checkpoint
     if multiscale:
         from model.mymodel_r36_r72_r144 import PriorBIMDA
@@ -357,6 +358,10 @@ def main():
         from model.dense2dense import PriorBIMDA
 
         print("Detected dense-to-dense checkpoint", flush=True)
+    elif scale_shift:
+        from model.mymodel1_onlyscale_shift import PriorBIMDA
+
+        print("Detected global scale-and-shift checkpoint", flush=True)
     else:
         from model.mymodel import PriorBIMDA
 

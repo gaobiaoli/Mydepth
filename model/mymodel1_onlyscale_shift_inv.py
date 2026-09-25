@@ -15,10 +15,63 @@ MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
 BIM_LOG_MEAN = 0.4236631010536673
 BIM_LOG_STD = 0.7573384621476941
 
+def absrel_optimal_shift(pred, target, valid):
+    pred = pred.float()
+    target = target.float()
 
-#计划方案1 强scale 弱refiner, 训练scale后，冻结DINOv2 backbone和neck，训练refiner
-#计划2：合成数据集，利用label = wall,floor 等的区域的gt当成bim prior
-#计划3 r36处，汇总特征后
+    valid = (
+        (valid > 0.5)
+        & torch.isfinite(pred)
+        & torch.isfinite(target)
+        & (target > 1e-3)
+    )
+
+    batch_size = pred.shape[0]
+
+    shift = pred.new_zeros(
+        (batch_size, 1, 1, 1)
+    )
+
+    supported = torch.zeros(
+        batch_size,
+        dtype=torch.bool,
+        device=pred.device,
+    )
+
+    for i in range(batch_size):
+        mask = valid[i].reshape(-1)
+
+        if not bool(mask.any()):
+            continue
+
+        pred_i = pred[i].reshape(-1)[mask]
+        target_i = target[i].reshape(-1)[mask]
+
+        residual = target_i - pred_i
+        weight = 1.0 / target_i
+
+        order = torch.argsort(residual)
+
+        residual = residual[order]
+        weight = weight[order]
+
+        cumulative = torch.cumsum(weight, dim=0)
+        cutoff = 0.5 * weight.sum()
+
+        index = torch.searchsorted(
+            cumulative,
+            cutoff,
+            right=False,
+        )
+
+        index = index.clamp_max(
+            residual.numel() - 1
+        )
+
+        shift[i, 0, 0, 0] = residual[index]
+        supported[i] = True
+
+    return shift, supported
 
 def build_bim_condition(da3_depth, bim_depth, bim_valid):
     """Condition used by the zero-initialized DINOv2 patch projection."""
@@ -113,27 +166,15 @@ class PriorBIMDA(nn.Module):
         nn.init.zeros_(self.bim_condition_embed.weight)
         nn.init.zeros_(self.bim_condition_embed.bias)
 
-        self.scale_head = nn.Sequential(
+        self.calibration_head = nn.Sequential(
             nn.LayerNorm(1536),
             nn.Linear(1536, 256),
             nn.GELU(),
             nn.Dropout(0.0),
-            nn.Linear(256, 1),
+            nn.Linear(256, 2),
         )
-        nn.init.zeros_(self.scale_head[1].bias)
-        nn.init.zeros_(self.scale_head[4].bias)
-        nn.init.normal_(self.scale_head[4].weight, std=1e-3)
-
-        self.low2_head = nn.Sequential(
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, 1, 1),
-        )
-        nn.init.kaiming_normal_(self.low2_head[0].weight, nonlinearity="relu")
-        nn.init.zeros_(self.low2_head[0].bias)
-        nn.init.zeros_(self.low2_head[2].weight)
-        nn.init.zeros_(self.low2_head[2].bias)
-        self.calibrated_disagreement_adapter = DisagreementAdapter()
+        nn.init.zeros_(self.calibration_head[4].weight)
+        nn.init.zeros_(self.calibration_head[4].bias)
 
         self.dav2.head.requires_grad_(False)
         self.register_buffer(
@@ -212,58 +253,159 @@ class PriorBIMDA(nn.Module):
         f36 = top_down + fusion36.residual_layer1(projected[2])
         return fusion36.projection(fusion36.residual_layer2(f36))
 
-    def predict_log_scale(self, rgb, da3_depth, bim_depth, bim_valid):
-        condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
-        tokens, _ = self._encode(rgb, condition, return_features=False)
-        descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
-        # return self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
-        # return self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
-        return self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
+    # def predict_log_scale(self, rgb, da3_depth, bim_depth, bim_valid):
+    #     condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
+    #     tokens, _ = self._encode(rgb, condition, return_features=False)
+    #     descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
+    #     # return self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
+    #     # return self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
+    #     return self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
 
     def forward(self, rgb, da3_depth, bim_depth, bim_valid):
-        condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
-        tokens, _ = self._encode(rgb, condition, return_features=False)
-        descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
-        log_scale = self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
-        # log_scale = self.scale_head(tokens[:, 1:].mean(1).float()).view(-1, 1, 1, 1)
-        # log_scale = self.scale_head(tokens[:, 0].float()).view(-1, 1, 1, 1)
+        condition = build_bim_condition(
+            da3_depth,
+            bim_depth,
+            bim_valid,
+        )
 
-        scaled_depth = da3_depth.float() * log_scale.exp()
-        depth = scaled_depth.clamp(1e-3, 128)
+        tokens, _ = self._encode(
+            rgb,
+            condition,
+            return_features=False,
+        )
+
+        descriptor = torch.cat(
+            [
+                tokens[:, 0],
+                tokens[:, 1:].mean(1),
+            ],
+            dim=1,
+        ).float()
+
+        params = self.calibration_head(descriptor)
+
+        log_scale = params[:, 0].view(-1, 1, 1, 1)
+        relative_shift = params[:, 1].view(-1, 1, 1, 1)
+
+        raw_depth = da3_depth.float().clamp_min(1e-3)
+
+        # ---------------------------------------------------------
+        # Shared scene-scale reference
+        # ---------------------------------------------------------
+        flat_depth = raw_depth.flatten(1)
+
+        reference_depth = torch.stack(
+            [
+                torch.median(flat_depth[i])
+                for i in range(flat_depth.shape[0])
+            ],
+            dim=0,
+        ).view(-1, 1, 1, 1)
+
+        # ---------------------------------------------------------
+        # Convert to inverse-depth space
+        # ---------------------------------------------------------
+        raw_inverse_depth = raw_depth.reciprocal()
+
+        reference_inverse_depth = reference_depth.reciprocal()
+
+        # ---------------------------------------------------------
+        # Global affine calibration in inverse-depth space
+        # ---------------------------------------------------------
+        scaled_inverse_depth = (
+            raw_inverse_depth * log_scale.exp()
+        )
+
+        minimum_scaled_inverse = (
+            scaled_inverse_depth
+            .flatten(1)
+            .amin(dim=1)
+            .view(-1, 1, 1, 1)
+        )
+
+        inverse_shift = (
+            minimum_scaled_inverse
+            * torch.expm1(relative_shift)
+        )
+
+        # Algebraically this is scaled_inverse_depth + inverse_shift.
+        # Writing it this way avoids cancellation when relative_shift is
+        # strongly negative and keeps every inverse-depth value positive.
+        affine_inverse_depth = (
+            scaled_inverse_depth - minimum_scaled_inverse
+            + minimum_scaled_inverse * relative_shift.exp()
+        )
+
+        # ---------------------------------------------------------
+        # Convert back to metric depth
+        # ---------------------------------------------------------
+        affine_depth = affine_inverse_depth.reciprocal()
+
+        depth = affine_depth.clamp(1e-3, 128)
+
         return {
             "depth": depth,
-            "scaled_depth": scaled_depth,
+            "affine_depth": affine_depth,
+            "scaled_depth": scaled_inverse_depth.reciprocal(),
+            "raw_inverse_depth": raw_inverse_depth,
+            "scaled_inverse_depth": scaled_inverse_depth,
+            "affine_inverse_depth": affine_inverse_depth,
+
             "log_scale": log_scale,
+            "relative_shift": relative_shift,
+            "inverse_shift": inverse_shift,
+
+            "reference_depth": reference_depth,
+            "reference_inverse_depth": reference_inverse_depth,
         }
-
-    def compute_loss(self, output, batch, equivariance_error=None):
-        """Compute the global-scale and scale-equivariance objectives."""
+        
+    def compute_loss(
+        self,
+        output,
+        batch,
+    ):
         target = batch["gt_depth"].float()
-        oracle_scale, supported = absrel_optimal_log_scale(
-            batch["da3_depth"].float(), target, batch["gt_valid"]
-        )
-        scale_error = F.smooth_l1_loss(
-            output["log_scale"].flatten(1).mean(1),
-            oracle_scale.flatten(1).mean(1),
-            reduction="none",
-            beta=0.02,
-        )
-        scale_loss = (
-            scale_error[supported].mean()
-            if bool(supported.any())
-            else output["log_scale"].sum() * 0
-        )
-        equivariance_loss = (
-            equivariance_error.float().square().mean()
-            if equivariance_error is not None
-            else output["log_scale"].sum() * 0
+
+        pred = output["affine_depth"].float()
+
+        valid = (
+            (batch["gt_valid"] > 0.5)
+            & torch.isfinite(target)
+            & torch.isfinite(pred)
+            & (target > 1e-3)
         )
 
-        total = scale_loss + 0.2 * equivariance_loss
+        absrel = (
+            (pred - target).abs()
+            / target.clamp_min(1e-3)
+        )
+
+        valid_float = valid.float()
+
+        count = (
+            valid_float
+            .flatten(1)
+            .sum(1)
+            .clamp_min(1)
+        )
+
+        frame_loss = (
+            (absrel * valid_float)
+            .flatten(1)
+            .sum(1)
+            / count
+        )
+
+        depth_loss = frame_loss.mean()
+
+
+        total = (
+            depth_loss
+        )
+
         return {
             "total": total,
-            "scale": scale_loss,
-            "equivariance": equivariance_loss,
+            "depth": depth_loss,
         }
 
 
@@ -274,7 +416,8 @@ class PriorBIMDA(nn.Module):
         return [
             {"params": self.dav2.backbone.parameters(), "lr": 5e-6 * factor},
             {"params": self.bim_condition_embed.parameters(), "lr": 5e-5 * factor},
-            {"params": self.scale_head.parameters(), "lr": 5e-5 * factor},
+            {"params": self.calibration_head.parameters(), "lr": 5e-5 * factor},
+            
         ]
 
     def load_checkpoint(self, path: str | Path):

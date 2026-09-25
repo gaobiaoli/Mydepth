@@ -506,8 +506,8 @@ def main(model_class=PriorBIMDA):
         "--full-deterministic",
         action="store_true",
         help=(
-            "enable strict deterministic algorithms and replace DINOv2 "
-            "bicubic position interpolation with deterministic matmuls"
+            "enable strict deterministic algorithms and freeze DINOv2 "
+            "position embeddings to avoid interpolation backward"
         ),
     )
     parser.add_argument("--local-files-only", action="store_true")
@@ -544,8 +544,8 @@ def main(model_class=PriorBIMDA):
     if args.full_deterministic:
         configure_full_deterministic_model(model)
         print(
-            "Full deterministic mode: strict algorithms and deterministic "
-            "DINOv2 position interpolation; position embeddings trainable",
+            "Full deterministic mode: strict algorithms; DINOv2 position "
+            "embeddings frozen",
             flush=True,
         )
     
