@@ -347,11 +347,16 @@ def main():
     )
     state = checkpoint.get("model", checkpoint)
     multiscale = any(name.startswith("stage72.") for name in state)
+    dense2dense = any(name.startswith("dense_head.") for name in state)
     del state, checkpoint
     if multiscale:
         from model.mymodel_r36_r72_r144 import PriorBIMDA
 
         print("Detected adapter R36/R72/R144 checkpoint", flush=True)
+    elif dense2dense:
+        from model.dense2dense import PriorBIMDA
+
+        print("Detected dense-to-dense checkpoint", flush=True)
     else:
         from model.mymodel import PriorBIMDA
 

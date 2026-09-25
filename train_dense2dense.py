@@ -87,7 +87,7 @@ def evaluate_test(model, loader, device, amp, checkpoint_path, output_dir):
     print("test " + json.dumps(result), flush=True)
 
 
-def main():
+def main(model_class=PriorBIMDA):
     parser = argparse.ArgumentParser(
         description="Train the PriorDA-style dense-to-dense log-scale model."
     )
@@ -129,7 +129,7 @@ def main():
         args, sampler_generator, worker_generator
     )
 
-    model = PriorBIMDA.from_pretrained(local_files_only=args.local_files_only).to(
+    model = model_class.from_pretrained(local_files_only=args.local_files_only).to(
         device
     )
     if args.full_deterministic:
