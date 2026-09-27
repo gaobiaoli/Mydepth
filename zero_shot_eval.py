@@ -30,7 +30,7 @@ EXPECTED_SELECTION = {
 }
 DEFAULT_SCENES = tuple(EXPECTED_SELECTION)
 ALL_SCENE = "all"
-DEFAULT_DA3_CACHE = "/root/Mydepth/outputs/zero_shot_raw/da3_cache"
+DEFAULT_DA3_CACHE = "/mnt/priorbimda-data/zero_shot_raw/da3_cache"
 
 
 def frame_set_sha256(frame_ids):
@@ -346,11 +346,18 @@ def main():
         mmap=True,
     )
     state = checkpoint.get("model", checkpoint)
+    scale_shift_dense2dense = any(
+        name.startswith("calibrator.calibration_head.") for name in state
+    ) and any(name.startswith("refiner.dense_head.") for name in state)
     multiscale = any(name.startswith("stage72.") for name in state)
     dense2dense = any(name.startswith("dense_head.") for name in state)
     scale_shift = any(name.startswith("calibration_head.") for name in state)
     del state, checkpoint
-    if multiscale:
+    if scale_shift_dense2dense:
+        from model.scale_shift_dense2dense_noweight import PriorBIMDA
+
+        print("Detected frozen scale-shift + dense-to-dense checkpoint", flush=True)
+    elif multiscale:
         from model.mymodel_r36_r72_r144 import PriorBIMDA
 
         print("Detected adapter R36/R72/R144 checkpoint", flush=True)

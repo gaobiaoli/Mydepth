@@ -20,7 +20,7 @@ from train import (
     seed_everything,
     seed_worker,
 )
-from zero_shot_eval import evaluate_zero_shot
+from zero_shot_eval import DEFAULT_DA3_CACHE, evaluate_zero_shot
 
 
 def build_loaders(args, sampler_generator, worker_generator):
@@ -102,6 +102,7 @@ def main(model_class=PriorBIMDA):
     )
     parser.add_argument("--extra-dataset-stride", type=int, default=1)
     parser.add_argument("--s23-root", default="/home/bgao491/Stanford2D3DS/no_xyz")
+    parser.add_argument("--da3-cache", default=DEFAULT_DA3_CACHE)
     parser.add_argument("--output", default="outputs/dense2dense_syncbim_stride1")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -255,7 +256,9 @@ def main(model_class=PriorBIMDA):
             device,
             best_path,
             output_dir / "zero_shot_metrics.json",
+            da3_cache=args.da3_cache,
             allow_network=not args.local_files_only,
+            mesh_source="obj",
         )
 
 

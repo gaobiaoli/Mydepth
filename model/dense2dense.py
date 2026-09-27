@@ -20,7 +20,7 @@ BIM_LOG_STD = 0.7573384621476941
 def build_bim_condition(da3_depth, bim_depth, bim_valid):
     valid = (bim_valid > 0.5) & (bim_depth > 1e-3) & torch.isfinite(bim_depth)
     if not bool((torch.isfinite(da3_depth) & (da3_depth > 1e-3)).all()):
-        raise ValueError("DA3 depth must be positive and finite")
+        raise ValueError("DA3 depth must be finite and strictly greater than 1e-3")
 
     log_bim = bim_depth.clamp_min(1e-3).log()
     normalized_bim = (log_bim - BIM_LOG_MEAN) / BIM_LOG_STD
