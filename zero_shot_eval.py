@@ -99,6 +99,17 @@ def prediction_depths(output, da3_depth):
         "global_scale": scaled_depth,
     }
 
+    explicit_stages = []
+    prefix = "depth_r"
+    for name, depth in output.items():
+        if name.startswith(prefix) and name[len(prefix) :].isdigit():
+            explicit_stages.append((int(name[len(prefix) :]), depth))
+    if explicit_stages:
+        for resolution, depth in sorted(explicit_stages):
+            predictions[f"r{resolution}"] = depth.float()
+        predictions["final"] = output["depth"].float()
+        return predictions
+
     stages = []
     prefix = "log_residual_r"
     for name, residual in output.items():
@@ -350,13 +361,25 @@ def main():
         name.startswith("calibrator.calibration_head.") for name in state
     ) and any(name.startswith("refiner.dense_head.") for name in state)
     multiscale = any(name.startswith("stage72.") for name in state)
+    multiscale_scale_shift = multiscale and (
+        state.get("scale_head.4.weight", torch.empty(0)).shape[:1] == (2,)
+        and state.get("stage36.head.2.weight", torch.empty(0)).shape[:1] == (2,)
+    )
     dense2dense = any(name.startswith("dense_head.") for name in state)
     scale_shift = any(name.startswith("calibration_head.") for name in state)
+    spatial_scale_shift = (
+        state.get("scale_head.4.weight", torch.empty(0)).shape[:1] == (2,)
+        and state.get("low2_head.2.weight", torch.empty(0)).shape[:1] == (2,)
+    )
     del state, checkpoint
     if scale_shift_dense2dense:
         from model.scale_shift_dense2dense_noweight import PriorBIMDA
 
         print("Detected frozen scale-shift + dense-to-dense checkpoint", flush=True)
+    elif multiscale_scale_shift:
+        from model.mymodel_r36_r72_r144_nw import PriorBIMDA
+
+        print("Detected multi-scale scale-and-shift checkpoint", flush=True)
     elif multiscale:
         from model.mymodel_r36_r72_r144 import PriorBIMDA
 
@@ -365,6 +388,10 @@ def main():
         from model.dense2dense import PriorBIMDA
 
         print("Detected dense-to-dense checkpoint", flush=True)
+    elif spatial_scale_shift:
+        from model.mymodel1_noweight_ss import PriorBIMDA
+
+        print("Detected global + R36 scale-and-shift checkpoint", flush=True)
     elif scale_shift:
         from model.mymodel1_onlyscale_shift import PriorBIMDA
 

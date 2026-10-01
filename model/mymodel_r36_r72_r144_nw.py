@@ -1,4 +1,4 @@
-# Multi-scale adapter model: independently refine log depth at F36, F72, and F144.
+# Multi-scale scale-shift model: affine calibration at global, F36, F72 and F144.
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,8 +7,6 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-from loss.common import absrel_optimal_log_scale
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 MODEL_REVISION = "9560f57a2f07803ba353bb918d6a6e5e005b9277"
@@ -40,23 +38,22 @@ def build_adapter_condition(
     da3_depth,
     bim_depth,
     bim_valid,
-    cumulative_log_correction,
+    calibrated_depth,
     size,
 ):
-    """Pool BIM disagreement after the previous, detached correction."""
-    correction = cumulative_log_correction.detach().float()
+    """Pool BIM disagreement after the previous detached affine stage."""
+    calibrated_depth = calibrated_depth.detach().float()
     valid = (
         (bim_valid > 0.5)
         & (bim_depth > 1e-3)
         & torch.isfinite(bim_depth)
         & (da3_depth > 1e-3)
         & torch.isfinite(da3_depth)
-        & torch.isfinite(correction)
+        & (calibrated_depth > 1e-3)
+        & torch.isfinite(calibrated_depth)
     )
     mask = valid.float()
-    disagreement = (
-        bim_depth.clamp_min(1e-3).log() - da3_depth.clamp_min(1e-3).log() - correction
-    )
+    disagreement = bim_depth.clamp_min(1e-3).log() - calibrated_depth.log()
     pooled_mask = F.adaptive_avg_pool2d(mask, size)
 
     def masked_pool(value):
@@ -110,8 +107,8 @@ class DisagreementAdapter(nn.Module):
         return self.output_projection(value)
 
 
-class ResidualStage(nn.Module):
-    """One independent three-ResBlock disagreement adapter and residual head."""
+class AffineStage(nn.Module):
+    """One three-ResBlock adapter predicting log-scale and relative shift."""
 
     def __init__(self):
         super().__init__()
@@ -119,7 +116,7 @@ class ResidualStage(nn.Module):
         self.head = nn.Sequential(
             nn.Conv2d(128, 64, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(64, 1, 1),
+            nn.Conv2d(64, 2, 1),
         )
         nn.init.kaiming_normal_(self.head[0].weight, nonlinearity="relu")
         nn.init.zeros_(self.head[0].bias)
@@ -130,11 +127,13 @@ class ResidualStage(nn.Module):
         dtype = self.adapter.input_projection.weight.dtype
         delta = self.adapter(condition.to(dtype=dtype))
         logits = self.head(feature + delta.to(dtype=feature.dtype))
-        return 0.25 * torch.tanh(logits)
+        log_scale = 0.1 * torch.tanh(logits[:, :1])
+        relative_shift = 0.1 * torch.tanh(logits[:, 1:2])
+        return log_scale, relative_shift
 
 
 class PriorBIMDA(nn.Module):
-    """Global scale followed by independent F36, F72, and F144 refiners."""
+    """Global affine calibration followed by F36/F72/F144 affine stages."""
 
     patch_size = 14
 
@@ -151,15 +150,15 @@ class PriorBIMDA(nn.Module):
             nn.Linear(1536, 256),
             nn.GELU(),
             nn.Dropout(0.0),
-            nn.Linear(256, 1),
+            nn.Linear(256, 2),
         )
         nn.init.zeros_(self.scale_head[1].bias)
+        nn.init.zeros_(self.scale_head[4].weight)
         nn.init.zeros_(self.scale_head[4].bias)
-        nn.init.normal_(self.scale_head[4].weight, std=1e-3)
 
-        self.stage36 = ResidualStage()
-        self.stage72 = ResidualStage()
-        self.stage144 = ResidualStage()
+        self.stage36 = AffineStage()
+        self.stage72 = AffineStage()
+        self.stage144 = AffineStage()
         self.dav2.head.requires_grad_(False)
 
         self.register_buffer(
@@ -274,13 +273,33 @@ class PriorBIMDA(nn.Module):
         condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
         tokens, _ = self._encode(rgb, condition, return_features=False)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
-        return self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
+        return self.scale_head(descriptor.float())[:, :1].view(-1, 1, 1, 1)
+
+    @staticmethod
+    def _apply_affine(depth, log_scale, relative_shift, reference_depth):
+        affine_depth = depth * log_scale.float().exp()
+        affine_depth = affine_depth + reference_depth * relative_shift.float()
+        return affine_depth, affine_depth.clamp(1e-3, 128)
 
     def forward(self, rgb, da3_depth, bim_depth, bim_valid):
         condition = build_bim_condition(da3_depth, bim_depth, bim_valid)
         tokens, features = self._encode(rgb, condition)
         descriptor = torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], dim=1)
-        log_scale = self.scale_head(descriptor.float()).view(-1, 1, 1, 1)
+        params = self.scale_head(descriptor.float())
+        log_scale = params[:, :1].view(-1, 1, 1, 1)
+        relative_shift = params[:, 1:2].view(-1, 1, 1, 1)
+
+        raw_depth = da3_depth.float()
+        flat_depth = raw_depth.flatten(1)
+        reference_depth = torch.stack(
+            [torch.median(flat_depth[i]) for i in range(flat_depth.shape[0])]
+        ).view(-1, 1, 1, 1)
+        global_affine_depth, global_depth = self._apply_affine(
+            raw_depth,
+            log_scale,
+            relative_shift,
+            reference_depth,
+        )
 
         feature36, feature72, feature144 = self._decode_features(
             features,
@@ -293,51 +312,72 @@ class PriorBIMDA(nn.Module):
             da3_depth,
             bim_depth,
             bim_valid,
-            log_scale,
+            global_depth,
             feature36.shape[-2:],
         )
-        residual36 = self.stage36(feature36, condition36)
-        residual36_full = self._resize(residual36, output_size)
+        log_scale36, relative_shift36 = self.stage36(feature36, condition36)
+        log_scale36_full = self._resize(log_scale36, output_size)
+        relative_shift36_full = self._resize(relative_shift36, output_size)
+        affine_depth36, depth36 = self._apply_affine(
+            global_depth,
+            log_scale36_full,
+            relative_shift36_full,
+            reference_depth,
+        )
 
-        correction36 = log_scale + residual36_full
         condition72 = build_adapter_condition(
             da3_depth,
             bim_depth,
             bim_valid,
-            correction36,
+            depth36,
             feature72.shape[-2:],
         )
-        residual72 = self.stage72(feature72, condition72)
-        residual72_full = self._resize(residual72, output_size)
+        log_scale72, relative_shift72 = self.stage72(feature72, condition72)
+        log_scale72_full = self._resize(log_scale72, output_size)
+        relative_shift72_full = self._resize(relative_shift72, output_size)
+        affine_depth72, depth72 = self._apply_affine(
+            depth36,
+            log_scale72_full,
+            relative_shift72_full,
+            reference_depth,
+        )
 
-        correction72 = correction36 + residual72_full
         condition144 = build_adapter_condition(
             da3_depth,
             bim_depth,
             bim_valid,
-            correction72,
+            depth72,
             feature144.shape[-2:],
         )
-        residual144 = self.stage144(feature144, condition144)
-        residual144_full = self._resize(residual144, output_size)
-
-        log_residual = residual36_full + residual72_full + residual144_full
-        log_residual_native = (
-            self._resize(residual36, feature144.shape[-2:])
-            + self._resize(residual72, feature144.shape[-2:])
-            + residual144
+        log_scale144, relative_shift144 = self.stage144(feature144, condition144)
+        log_scale144_full = self._resize(log_scale144, output_size)
+        relative_shift144_full = self._resize(relative_shift144, output_size)
+        affine_depth144, depth144 = self._apply_affine(
+            depth72,
+            log_scale144_full,
+            relative_shift144_full,
+            reference_depth,
         )
-        scaled_depth = da3_depth.float() * log_scale.exp()
-        depth = (scaled_depth * log_residual.float().exp()).clamp(1e-3, 128)
+
         return {
-            "depth": depth,
-            "scaled_depth": scaled_depth,
+            "depth": depth144,
+            "affine_depth": affine_depth144,
+            "scaled_depth": global_depth,
+            "global_affine_depth": global_affine_depth,
             "log_scale": log_scale,
-            "log_residual": log_residual,
-            "log_residual_native": log_residual_native,
-            "log_residual_r36": residual36,
-            "log_residual_r72": residual72,
-            "log_residual_r144": residual144,
+            "relative_shift": relative_shift,
+            "reference_depth": reference_depth,
+            "depth_r36": depth36,
+            "depth_r72": depth72,
+            "depth_r144": depth144,
+            "affine_depth_r36": affine_depth36,
+            "affine_depth_r72": affine_depth72,
+            "log_scale_r36": log_scale36,
+            "log_scale_r72": log_scale72,
+            "log_scale_r144": log_scale144,
+            "relative_shift_r36": relative_shift36,
+            "relative_shift_r72": relative_shift72,
+            "relative_shift_r144": relative_shift144,
         }
 
     def compute_loss(self, output, batch, equivariance_error=None):
@@ -371,78 +411,54 @@ class PriorBIMDA(nn.Module):
             return 0.5 * (pixel_loss + frame_loss)
 
         output_size = target.shape[-2:]
-        residual36 = F.interpolate(
-            output["log_residual_r36"].float(),
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-        residual72 = F.interpolate(
-            output["log_residual_r72"].float(),
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-        residual144 = F.interpolate(
-            output["log_residual_r144"].float(),
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
-        log_scale = output["log_scale"].float()
-        da3_depth = batch["da3_depth"].float()
 
-        depth36 = (
-            da3_depth * (log_scale.detach() + residual36).exp()
-        ).clamp(1e-3, 128)
-        depth72 = (
-            da3_depth * (log_scale.detach() + residual36 + residual72).exp()
-        ).clamp(1e-3, 128)
-        depth144 = (
-            da3_depth
-            * (
-                log_scale.detach()
-                + residual36.detach()
-                + residual72.detach()
-                + residual144
-            ).exp()
-        ).clamp(1e-3, 128)
+        def resize(value):
+            return F.interpolate(
+                value.float(),
+                size=output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        reference_depth = output["reference_depth"].float()
+        global_depth = output["scaled_depth"].float()
+        scale36 = resize(output["log_scale_r36"])
+        shift36 = resize(output["relative_shift_r36"])
+        scale72 = resize(output["log_scale_r72"])
+        shift72 = resize(output["relative_shift_r72"])
+        scale144 = resize(output["log_scale_r144"])
+        shift144 = resize(output["relative_shift_r144"])
+
+        _, depth36 = self._apply_affine(
+            global_depth.detach(), scale36, shift36, reference_depth
+        )
+        _, depth72 = self._apply_affine(
+            depth36, scale72, shift72, reference_depth
+        )
+        _, depth144 = self._apply_affine(
+            depth72.detach(), scale144, shift144, reference_depth
+        )
 
         loss36 = depth_loss(depth36)
         loss72 = depth_loss(depth72)
         loss144 = depth_loss(depth144)
         combined_depth_loss = 0.2 * loss36 + 0.3 * loss72 + 0.5 * loss144
 
-        oracle_scale, supported = absrel_optimal_log_scale(
-            da3_depth,
-            target,
-            batch["gt_valid"],
-        )
-        scale_error = F.smooth_l1_loss(
-            log_scale.flatten(1).mean(1),
-            oracle_scale.flatten(1).mean(1),
-            reduction="none",
-            beta=0.02,
-        )
-        scale_loss = (
-            scale_error[supported].mean()
-            if bool(supported.any())
-            else depth144.sum() * 0
-        )
+        global_loss = depth_loss(global_depth)
         equivariance_loss = (
             equivariance_error.float().square().mean()
             if equivariance_error is not None
             else depth144.sum() * 0
         )
 
-        total = combined_depth_loss + 0.5 * scale_loss + 0.1 * equivariance_loss
+        total = combined_depth_loss + 0.5 * global_loss + 0.1 * equivariance_loss
         return {
             "total": total,
             "depth": combined_depth_loss,
             "depth_r36": loss36,
             "depth_r72": loss72,
             "depth_r144": loss144,
-            "scale": scale_loss,
+            "scale": global_loss,
             "equivariance": equivariance_loss,
         }
 

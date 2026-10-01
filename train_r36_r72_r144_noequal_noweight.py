@@ -3,4 +3,4 @@ from train_r36_r72_r144_noequal import main
 
 
 if __name__ == "__main__":
-    main(PriorBIMDA)
+    main(PriorBIMDA, zero_shot_mesh_source="obj")

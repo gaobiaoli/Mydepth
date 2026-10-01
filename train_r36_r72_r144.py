@@ -36,6 +36,15 @@ PREDICTION_NAMES = (*STAGE_NAMES, "final")
 
 def stage_predictions(output, da3_depth):
     """Build the cumulative depth prediction after each residual stage."""
+    if all(name in output for name in ("depth_r36", "depth_r72", "depth_r144")):
+        return {
+            "da3": da3_depth.float(),
+            "global_scale": output["scaled_depth"].float(),
+            "r36": output["depth_r36"].float(),
+            "r72": output["depth_r72"].float(),
+            "r144": output["depth_r144"].float(),
+        }
+
     size = da3_depth.shape[-2:]
 
     def resize(value):
@@ -220,10 +229,11 @@ def evaluate_zero_shot(
     scenes=DEFAULT_SCENES,
     da3_cache=DEFAULT_DA3_CACHE,
     allow_network=False,
+    mesh_source="obj_wall_filled",
 ):
     """Run the frozen zero-shot protocol with all residual stages exposed."""
     scenes = list(scenes)
-    dataset = MP3D_BIMDataset(default_mesh_source="obj_wall_filled")
+    dataset = MP3D_BIMDataset(default_mesh_source=mesh_source)
     da3_predictor = DA3Predictor(
         device=device,
         cache_root=da3_cache,
@@ -252,7 +262,7 @@ def evaluate_zero_shot(
         "protocol": {
             "scenes": scenes,
             "process_resolution": DA3_PROCESS_RES,
-            "mesh": "registered wall-filled BIMNet OBJ",
+            "mesh": f"registered BIMNet {mesh_source}",
             "selection": "GT>10%, BIM hits>20%, camera inside BIM AABB",
             "aggregation": "pixel-micro and frame-macro over selected frames",
             "predictions": list(PREDICTION_NAMES),

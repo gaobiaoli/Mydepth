@@ -24,7 +24,7 @@ from train_r36_r72_r144 import (
 )
 
 
-def main(model_class=PriorBIMDA):
+def main(model_class=PriorBIMDA, zero_shot_mesh_source="obj_wall_filled"):
     parser = argparse.ArgumentParser(
         description="Train the R36/R72/R144 model without equivariance loss."
     )
@@ -230,6 +230,7 @@ def main(model_class=PriorBIMDA):
             best_path,
             output_dir / "zero_shot_metrics.json",
             allow_network=not args.local_files_only,
+            mesh_source=zero_shot_mesh_source,
         )
 
 
