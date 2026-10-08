@@ -133,7 +133,7 @@ def prediction_depths(output, da3_depth):
     return predictions
 
 
-def predict(model, sample, device, da3_predictor):
+def predict(model, sample, device, da3_predictor, no_bim=False):
     frame = sample["frame"]
     bim_depth = sample["bim_depth"]
     height, width = frame.image_shape
@@ -160,6 +160,9 @@ def predict(model, sample, device, da3_predictor):
     da3 = torch.from_numpy(da3_depth)[None, None].to(device)
     bim = torch.from_numpy(bim_depth)[None, None].to(device)
     bim_valid = bim > 0
+    if no_bim:
+        bim = torch.zeros_like(bim)
+        bim_valid = torch.zeros_like(bim_valid)
 
     amp_dtype = (
         torch.bfloat16
@@ -187,7 +190,7 @@ def predict(model, sample, device, da3_predictor):
     }
 
 
-def evaluate_scene(name, model, device, dataset, da3_predictor):
+def evaluate_scene(name, model, device, dataset, da3_predictor, no_bim=False):
     frames = dataset.frames(name)
     process_shapes = {
         da3_processed_geometry(frame.image_shape, frame.intrinsics)[:2]
@@ -205,7 +208,7 @@ def evaluate_scene(name, model, device, dataset, da3_predictor):
         gt_depth = sample["gt_depth"]
         gt_valid = np.isfinite(gt_depth) & (gt_depth > 0)
         selected_ids.append(sample["frame_id"])
-        predictions = predict(model, sample, device, da3_predictor)
+        predictions = predict(model, sample, device, da3_predictor, no_bim=no_bim)
         if not totals:
             totals = {
                 key: DepthMetricAccumulator()
@@ -247,8 +250,11 @@ def evaluate_zero_shot(
     da3_cache=DEFAULT_DA3_CACHE,
     allow_network=False,
     mesh_source="obj",
+    no_bim=None,
 ):
     """Evaluate a loaded model on selected Matterport3D/BIMNet scene pairs."""
+    if no_bim is None:
+        no_bim = getattr(model, "no_bim", False)
     dataset = MP3D_BIMDataset(default_mesh_source=mesh_source)
     scenes = resolve_scenes(dataset, scenes)
     print(f"Evaluating {len(scenes)} zero-shot scene(s): {', '.join(scenes)}", flush=True)
@@ -268,6 +274,7 @@ def evaluate_zero_shot(
             device,
             dataset,
             da3_predictor,
+            no_bim=no_bim,
         )
         scene_results[name] = result
         if overall and totals.keys() != overall.keys():
@@ -286,6 +293,8 @@ def evaluate_zero_shot(
         "aggregation": "pixel-micro and frame-macro over selected frames",
         "gt_usage": "scoring and frame selection only",
     }
+    if no_bim:
+        protocol["model_bim_input"] = "zero depth and mask"
     residual_stages = [
         name for name in overall if name.startswith("r") and name[1:].isdigit()
     ]
@@ -339,6 +348,11 @@ def main():
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--allow-network", action="store_true")
+    parser.add_argument(
+        "--no-bim",
+        action="store_true",
+        help="zero BIM depth and validity mask before model inference",
+    )
     parser.add_argument(
         "--mesh-source",
         choices=("obj", "wall-filled"),
@@ -411,6 +425,7 @@ def main():
         scenes=args.scenes,
         da3_cache=args.da3_cache,
         allow_network=args.allow_network,
+        no_bim=args.no_bim,
         mesh_source=(
             "obj_wall_filled" if args.mesh_source == "wall-filled" else "obj"
         ),
